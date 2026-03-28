@@ -1,0 +1,41 @@
+# --- DATA SENSITIF (WAJIB) ---
+.env
+*.env
+auth.json
+
+# --- PYTHON ---
+venv/
+.venv/
+env/
+bin/
+lib/
+share/
+Include/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# --- DATABASE & CACHE ---
+*.db
+*.sqlite3
+.redis_data/
+
+# --- DOCKER ---
+.waha/
+# Jika kamu tidak ingin meng-upload data sesi WAHA ke Git
+sessions/
+
+# --- IDE & TOOLS ---
+.vscode/
+.idea/
+*.swp
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+
+# --- PROYEK KHUSUS ---
+wa-sales-agent.zip
