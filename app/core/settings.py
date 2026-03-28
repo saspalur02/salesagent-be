@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
+# ERP Database
+erp_db_url: str = ""
+erp_batch_db_url: str = ""
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
