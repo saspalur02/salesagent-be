@@ -1,0 +1,14 @@
+python -c "
+import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+from app.db.redis_client import get_redis
+
+async def reset():
+    redis = await get_redis()
+    # Ganti dengan nomor WA kamu
+    await redis.delete('session:6281234567890')
+    print('Session cleared!')
+
+asyncio.run(reset())
+"

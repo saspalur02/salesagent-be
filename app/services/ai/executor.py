@@ -2,7 +2,6 @@
 Tool executor — menjalankan tool yang diminta LLM.
 Handle 2 mode: toko dan admin.
 """
-import json
 from app.core.logging import get_logger
 from app.core.settings import get_settings
 from app.services.erp import ERPClient
@@ -35,12 +34,17 @@ class TokoToolExecutor:
             return f"Error: {str(e)}"
 
     async def _cari_toko(self, nama_toko: str, alamat: str = "") -> str:
-        results = await self.erp.find_toko(nama_toko, alamat)
+        from app.services.erp.toko import find_toko_hybrid
+
+        results = await find_toko_hybrid(nama_toko, alamat)
+
         if not results:
             return (
                 f"Toko '{nama_toko}' tidak ditemukan di database. "
-                "Catat nama dan alamat toko untuk proses order tetap bisa dilanjutkan."
+                "Pesanan akan dicatat dengan nama dan alamat yang Anda berikan."
             )
+
+        # Hanya 1 hasil — langsung konfirmasi
         if len(results) == 1:
             t = results[0]
             return (
@@ -49,30 +53,44 @@ class TokoToolExecutor:
                 f"- Nama: {t['name']}\n"
                 f"- Alamat: {t['address']}"
             )
-        # Multiple results
-        lines = [f"Ditemukan {len(results)} toko, mohon konfirmasi:\n"]
-        for i, t in enumerate(results[:5], 1):
-            lines.append(f"{i}. {t['name']} — {t['address']}")
-        return "\n".join(lines)
+
+        # Banyak hasil dengan alamat — tampilkan max 10
+        if alamat and len(results) > 1:
+            lines = [f"Ditemukan {len(results)} toko '{nama_toko}' di area tersebut:\n"]
+            for i, t in enumerate(results[:10], 1):
+                lines.append(f"{i}. {t['name']} — {t['address']}")
+            lines.append("\nMohon sebutkan alamat yang lebih spesifik.")
+            return "\n".join(lines)
+
+        # Banyak hasil tanpa alamat — minta alamat dulu, jangan kirim list ke LLM
+        kota_list = list({t["address"].split(",")[-1].strip()
+                         for t in results[:10] if t["address"]})
+        kota_sample = ", ".join(kota_list[:5])
+        return (
+            f"Ditemukan {len(results)} toko dengan nama '{nama_toko}'.\n"
+            f"Tersebar di: {kota_sample}, dll.\n\n"
+            f"Mohon sebutkan *alamat* atau *kota* toko Anda."
+        )
 
     async def _cari_produk(self, query: str) -> str:
-        products = await self.erp.get_products(active_only=True)
-        query_lower = query.lower()
-        matches = [
-            p for p in products
-            if query_lower in p.get("name", "").lower()
-            or query_lower in p.get("code", "").lower()
-            or query_lower in p.get("alias", "").lower()
-        ]
-        if not matches:
-            return f"Produk '{query}' tidak ditemukan."
+        from app.services.vector import search_produk
 
-        lines = [f"Ditemukan {len(matches)} produk:\n"]
-        for p in matches[:5]:
-            lines.append(
-                f"- [{p['code']}] {p['name']} | "
-                f"Rp {p.get('price', 0):,.0f}/{p.get('uom', 'pcs')}"
+        matches = await search_produk(query, limit=5)
+        if not matches:
+            return (
+                f"Part '{query}' tidak ditemukan.\n"
+                "Coba gunakan kata kunci lain, misalnya kode part atau nama kendaraan."
             )
+
+        lines = [f"Ditemukan {len(matches)} part:\n"]
+        for p in matches:
+            kendaraan_info = ""
+            if p.get("merk_kendaraan") or p.get("type_kendaraan"):
+                kendaraan_info = f" | {p.get('merk_kendaraan', '')} {p.get('type_kendaraan', '')}".strip()
+            lines.append(
+                f"- [{p['code']}] {p['name']} | {p.get('uom', 'pcs')}{kendaraan_info}"
+            )
+        lines.append("\n_Harga dikonfirmasi oleh admin penjualan._")
         return "\n".join(lines)
 
     async def _kirim_ke_admin(
@@ -83,42 +101,30 @@ class TokoToolExecutor:
         toko_id: str = "UNKNOWN",
         note: str = "",
     ) -> str:
-        # Format pesan untuk admin
         lines = [
-            f"🛒 *DRAFT ORDER MASUK*",
-            f"",
+            "🛒 *DRAFT ORDER MASUK*",
+            "",
             f"*Toko:* {toko_name}",
             f"*Alamat:* {toko_address}",
             f"*Toko ID:* {toko_id}",
             f"*WA Toko:* {self.wa_number}",
-            f"",
-            f"*Detail Order:*",
+            "",
+            "*Detail Order:*",
         ]
-        total = 0
         for item in items:
-            subtotal = item.get("qty", 0) * item.get("price", 0)
-            total += subtotal
             lines.append(
                 f"- {item.get('product_name', '-')} "
-                f"x {item.get('qty', 0)} {item.get('uom', '')} "
-                f"@ Rp {item.get('price', 0):,.0f}"
-                + (f" = Rp {subtotal:,.0f}" if subtotal > 0 else "")
+                f"x {item.get('qty', 0)} {item.get('uom', '')}"
             )
 
-        if total > 0:
-            lines.append(f"")
-            lines.append(f"*Estimasi Total: Rp {total:,.0f}*")
-
         if note:
-            lines.append(f"")
-            lines.append(f"*Catatan:* {note}")
+            lines.append(f"\n*Catatan:* {note}")
 
-        lines.append(f"")
-        lines.append(f"_Silakan konfirmasi langsung ke toko dan kirim final order ke saya._")
+        lines.append("")
+        lines.append("_Silakan konfirmasi ke toko dan kirim final order ke saya._")
 
         pesan_admin = "\n".join(lines)
 
-        # Kirim ke semua nomor admin
         waha = WAHAClient()
         admin_numbers = settings.admin_wa_list
         if not admin_numbers:
@@ -157,21 +163,15 @@ class AdminToolExecutor:
             return f"Error: {str(e)}"
 
     async def _cari_produk(self, query: str) -> str:
-        products = await self.erp.get_products(active_only=True)
-        query_lower = query.lower()
-        matches = [
-            p for p in products
-            if query_lower in p.get("name", "").lower()
-            or query_lower in p.get("code", "").lower()
-            or query_lower in p.get("alias", "").lower()
-        ]
+        from app.services.vector import search_produk
+
+        matches = await search_produk(query, limit=5)
         if not matches:
-            return f"Produk '{query}' tidak ditemukan."
-        lines = [f"Ditemukan {len(matches)} produk:\n"]
-        for p in matches[:5]:
+            return f"Part '{query}' tidak ditemukan."
+        lines = [f"Ditemukan {len(matches)} part:\n"]
+        for p in matches:
             lines.append(
-                f"- [{p['code']}] {p['name']} | "
-                f"Rp {p.get('price', 0):,.0f}/{p.get('uom', 'pcs')}"
+                f"- [{p['code']}] {p['name']} | Satuan: {p.get('uom', 'pcs')}"
             )
         return "\n".join(lines)
 
@@ -182,7 +182,7 @@ class AdminToolExecutor:
         warehouse = stock.get("warehouse", "Gudang Utama")
         if qty <= 0:
             return f"Stok {product_code} habis di {warehouse}."
-        return f"Stok {product_code}: *{qty} {uom}* tersedia di {warehouse}."
+        return f"Stok *{product_code}*: {qty} {uom} tersedia di {warehouse}."
 
     async def _buat_sales_order(
         self, toko_id: str, items: list, note: str = ""
