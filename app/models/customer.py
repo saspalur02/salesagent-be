@@ -1,28 +1,7 @@
 from datetime import datetime
-from sqlalchemy import String, Boolean, DateTime, Text, Integer, JSON, func
+from sqlalchemy import String, DateTime, Text, Integer, JSON, func
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.database import Base
-
-
-class WACustomerMap(Base):
-    """
-    Mapping nomor WhatsApp → toko_id di ERP.
-    Disimpan setelah toko berhasil diidentifikasi
-    supaya tidak perlu tanya ulang di percakapan berikutnya.
-    """
-    __tablename__ = "wa_customer_map"
-
-    wa_number: Mapped[str] = mapped_column(String(20), primary_key=True)
-    toko_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    toko_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    toko_address: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    is_verified: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
 
 
 class DraftOrder(Base):

@@ -1,15 +1,17 @@
 """
-Vector Service — pgvector dengan 2 provider embedding:
-  - huggingface: sentence-transformers lokal (384 dim)
-  - litellm: via LiteLLM proxy (768 dim) — Gemini, OpenAI, dll
+Vector Service — pgvector dengan provider embedding terpisah per entity:
+  - EMBEDDING_PROVIDER_TOKO   : "huggingface" atau "litellm"
+  - EMBEDDING_PROVIDER_PRODUK : "huggingface" atau "litellm"
 
-Set EMBEDDING_PROVIDER di .env untuk pilih provider.
-Ganti provider → wajib re-sync data.
+Dimensi:
+  - huggingface : 384
+  - litellm     : 1536 (openai/text-embedding-3-small)
 """
 import asyncpg
 import litellm
 from app.core.settings import get_settings
 from app.core.logging import get_logger
+import re
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -17,25 +19,40 @@ logger = get_logger(__name__)
 _vector_pool: asyncpg.Pool | None = None
 _hf_model = None
 
-# Dimensi per provider
+# Override provider saat sync (dipakai oleh sync_embeddings.py)
+_current_provider: str | None = None
+
 EMBEDDING_DIM = {
     "huggingface": 384,
-    "litellm": 768,
+    "litellm": 1536,
 }
 
 HF_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+def clean_for_json(text: str) -> str:
+    if not text:
+        return ""
+    # 1. Hapus karakter kontrol (non-printable)
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+    # 2. Ganti kutipan ganda dengan tunggal agar aman di JSON
+    text = text.replace('"', "'")
+    # 3. Bersihkan whitespace berlebih
+    return " ".join(text.split())
+
+def get_provider_toko() -> str:
+    return _current_provider or settings.embedding_provider_toko
+
+
+def get_provider_produk() -> str:
+    return _current_provider or settings.embedding_provider_produk
+
 
 def get_table_toko() -> str:
-    return f"toko_vectors_{settings.embedding_provider}"
+    return f"toko_vectors_{get_provider_toko()}"
 
 
 def get_table_produk() -> str:
-    return f"produk_vectors_{settings.embedding_provider}"
-
-
-def get_dim() -> int:
-    return EMBEDDING_DIM.get(settings.embedding_provider, 768)
+    return f"produk_vectors_{get_provider_produk()}"
 
 
 async def get_vector_pool() -> asyncpg.Pool:
@@ -61,14 +78,15 @@ def _get_hf_model():
     return _hf_model
 
 
-async def embed_text(text: str) -> list[float]:
-    """Convert teks ke vector — pilih provider dari settings."""
-    if settings.embedding_provider == "huggingface":
+async def embed_text(text: str, provider: str | None = None) -> list[float]:
+    """Convert teks ke vector — pilih provider secara eksplisit atau dari settings."""
+    p = provider or _current_provider or settings.embedding_provider_toko
+
+    if p == "huggingface":
         model = _get_hf_model()
         vector = model.encode(text, normalize_embeddings=True)
         return vector.tolist()
     else:
-        # LiteLLM provider (Gemini, OpenAI, dll)
         response = await litellm.aembedding(
             model=settings.embedding_model,
             input=[text],
@@ -79,123 +97,80 @@ async def embed_text(text: str) -> list[float]:
 
 
 async def setup_tables():
-    """
-    Buat semua tabel vector store (HuggingFace + LiteLLM).
-    Dipanggil saat startup.
-    """
+    """Buat semua tabel vector store."""
     pool = await get_vector_pool()
     async with pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # ── HuggingFace tables (384 dim) ─────────────────────────
+        # HuggingFace (384 dim)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS toko_vectors_hf (
-                toko_id     INTEGER PRIMARY KEY,
-                kodetoko    VARCHAR(30),
-                namatoko    VARCHAR(100) NOT NULL,
-                alamat      VARCHAR(200),
-                kota        VARCHAR(100),
-                kecamatan   VARCHAR(100),
-                propinsi    VARCHAR(50),
-                hp          VARCHAR(30),
-                piutang     NUMERIC DEFAULT 0,
-                plafon      NUMERIC DEFAULT 0,
-                teks_cari   TEXT,
-                embedding   vector(384),
-                updated_at  TIMESTAMP DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS toko_vectors_huggingface (
+                toko_id INTEGER PRIMARY KEY, kodetoko VARCHAR(30),
+                namatoko VARCHAR(100) NOT NULL, alamat VARCHAR(200),
+                kota VARCHAR(100), kecamatan VARCHAR(100), propinsi VARCHAR(50),
+                hp VARCHAR(30), piutang NUMERIC DEFAULT 0, plafon NUMERIC DEFAULT 0,
+                teks_cari TEXT, embedding vector(384), updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS toko_vectors_hf_idx
-            ON toko_vectors_hf
-            USING ivfflat (embedding vector_cosine_ops)
+            ON toko_vectors_huggingface USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
-
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS produk_vectors_hf (
-                stock_id        INTEGER PRIMARY KEY,
-                kodebarang      VARCHAR(50),
-                namabarang      VARCHAR(250) NOT NULL,
-                satuan          VARCHAR(50),
-                kategori        VARCHAR(50),
-                brandproduct    VARCHAR(50),
-                merkkendaraan   VARCHAR(50),
-                typekendaraan   VARCHAR(50),
-                kendaraan       VARCHAR(50),
-                partno          VARCHAR(50),
-                teks_cari       TEXT,
-                embedding       vector(384),
-                updated_at      TIMESTAMP DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS produk_vectors_huggingface (
+                stock_id INTEGER PRIMARY KEY, kodebarang VARCHAR(50),
+                namabarang VARCHAR(250) NOT NULL, satuan VARCHAR(50),
+                kategori VARCHAR(50), brandproduct VARCHAR(50),
+                merkkendaraan VARCHAR(50), typekendaraan VARCHAR(50),
+                kendaraan VARCHAR(50), partno VARCHAR(50),
+                teks_cari TEXT, embedding vector(384), updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS produk_vectors_hf_idx
-            ON produk_vectors_hf
-            USING ivfflat (embedding vector_cosine_ops)
+            ON produk_vectors_huggingface USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
 
-        # ── LiteLLM tables (768 dim) ─────────────────────────────
+        # LiteLLM (1536 dim)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS toko_vectors_litellm (
-                toko_id     INTEGER PRIMARY KEY,
-                kodetoko    VARCHAR(30),
-                namatoko    VARCHAR(100) NOT NULL,
-                alamat      VARCHAR(200),
-                kota        VARCHAR(100),
-                kecamatan   VARCHAR(100),
-                propinsi    VARCHAR(50),
-                hp          VARCHAR(30),
-                piutang     NUMERIC DEFAULT 0,
-                plafon      NUMERIC DEFAULT 0,
-                teks_cari   TEXT,
-                embedding   vector(768),
-                updated_at  TIMESTAMP DEFAULT NOW()
+                toko_id INTEGER PRIMARY KEY, kodetoko VARCHAR(30),
+                namatoko VARCHAR(100) NOT NULL, alamat VARCHAR(200),
+                kota VARCHAR(100), kecamatan VARCHAR(100), propinsi VARCHAR(50),
+                hp VARCHAR(30), piutang NUMERIC DEFAULT 0, plafon NUMERIC DEFAULT 0,
+                teks_cari TEXT, embedding vector(1536), updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS toko_vectors_litellm_idx
-            ON toko_vectors_litellm
-            USING ivfflat (embedding vector_cosine_ops)
+            ON toko_vectors_litellm USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
-
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS produk_vectors_litellm (
-                stock_id        INTEGER PRIMARY KEY,
-                kodebarang      VARCHAR(50),
-                namabarang      VARCHAR(250) NOT NULL,
-                satuan          VARCHAR(50),
-                kategori        VARCHAR(50),
-                brandproduct    VARCHAR(50),
-                merkkendaraan   VARCHAR(50),
-                typekendaraan   VARCHAR(50),
-                kendaraan       VARCHAR(50),
-                partno          VARCHAR(50),
-                teks_cari       TEXT,
-                embedding       vector(768),
-                updated_at      TIMESTAMP DEFAULT NOW()
+                stock_id INTEGER PRIMARY KEY, kodebarang VARCHAR(50),
+                namabarang VARCHAR(250) NOT NULL, satuan VARCHAR(50),
+                kategori VARCHAR(50), brandproduct VARCHAR(50),
+                merkkendaraan VARCHAR(50), typekendaraan VARCHAR(50),
+                kendaraan VARCHAR(50), partno VARCHAR(50),
+                teks_cari TEXT, embedding vector(1536), updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS produk_vectors_litellm_idx
-            ON produk_vectors_litellm
-            USING ivfflat (embedding vector_cosine_ops)
+            ON produk_vectors_litellm USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
 
     logger.info("vector_tables_ready",
-                provider=settings.embedding_provider,
                 toko_table=get_table_toko(),
                 produk_table=get_table_produk())
 
 
-# ── Search ───────────────────────────────────────────────────────
-
 async def search_toko(query: str, limit: int = 200) -> list[dict]:
-    """Cari toko secara semantic."""
-    query_vector = await embed_text(query)
+    query_vector = await embed_text(query, provider=get_provider_toko())
     table = get_table_toko()
     pool = await get_vector_pool()
 
@@ -209,8 +184,7 @@ async def search_toko(query: str, limit: int = 200) -> list[dict]:
             ORDER BY embedding <=> $1::vector
             LIMIT $2
             """,
-            str(query_vector),
-            limit,
+            str(query_vector), limit,
         )
 
     return [
@@ -228,10 +202,27 @@ async def search_toko(query: str, limit: int = 200) -> list[dict]:
     ]
 
 
-async def search_produk(query: str, limit: int = 5) -> list[dict]:
-    """Cari spare part secara semantic."""
-    query_vector = await embed_text(query)
+async def search_produk(query: str, limit: int = 50) -> list[dict]:
+    provider = get_provider_produk()
     table = get_table_produk()
+
+    print("\n" + "="*60)
+    print("🔍 [DEBUG search_produk — VECTOR SEARCH]")
+    print("="*60)
+    print(f"Query       : '{query}'")
+    print(f"Provider    : {provider}")
+    print(f"Table       : {table}")
+    print(f"Limit       : {limit}")
+    print(f"SQL (pgAdmin):")
+    print(f"  SELECT stock_id, kodebarang, namabarang, satuan,")
+    print(f"         kategori, brandproduct, merkkendaraan,")
+    print(f"         typekendaraan, kendaraan, partno")
+    print(f"  FROM {table}")
+    print(f"  ORDER BY embedding <=> '<vector hasil embed>'::vector")
+    print(f"  LIMIT {limit};")
+    print("="*60 + "\n")
+
+    query_vector = await embed_text(query, provider=provider)
     pool = await get_vector_pool()
 
     async with pool.acquire() as conn:
@@ -242,12 +233,20 @@ async def search_produk(query: str, limit: int = 5) -> list[dict]:
                    typekendaraan, kendaraan, partno,
                    1 - (embedding <=> $1::vector) AS similarity
             FROM {table}
+            WHERE kodebarang NOT ILIKE 'SB%'
+              AND kodebarang NOT ILIKE 'SE%'
             ORDER BY embedding <=> $1::vector
             LIMIT $2
             """,
-            str(query_vector),
-            limit,
+            str(query_vector), limit,
         )
+
+    print(f"📊 [search_produk RESULT]: {len(rows)} baris dari vector table")
+    if rows:
+        print("   Top 5 hasil:")
+        for r in rows[:5]:
+            print(f"   - [{r['kodebarang']}] {r['namabarang']}")
+    print()
 
     return [
         {
@@ -267,19 +266,13 @@ async def search_produk(query: str, limit: int = 5) -> list[dict]:
     ]
 
 
-# ── Upsert ───────────────────────────────────────────────────────
-
 async def upsert_toko(toko: dict) -> None:
-    """Insert atau update satu toko ke vector store."""
     teks_cari = " ".join(filter(None, [
-        toko.get("namatoko", ""),
-        toko.get("alamat", ""),
-        toko.get("kota", ""),
-        toko.get("kecamatan", ""),
+        toko.get("namatoko", ""), toko.get("alamat", ""),
+        toko.get("kota", ""), toko.get("kecamatan", ""),
         toko.get("propinsi", ""),
     ]))
-
-    embedding = await embed_text(teks_cari)
+    embedding = await embed_text(teks_cari, provider=get_provider_toko())
     table = get_table_toko()
     pool = await get_vector_pool()
 
@@ -291,48 +284,49 @@ async def upsert_toko(toko: dict) -> None:
                  propinsi, hp, piutang, plafon, teks_cari, embedding, updated_at)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::vector,NOW())
             ON CONFLICT (toko_id) DO UPDATE SET
-                kodetoko    = EXCLUDED.kodetoko,
-                namatoko    = EXCLUDED.namatoko,
-                alamat      = EXCLUDED.alamat,
-                kota        = EXCLUDED.kota,
-                kecamatan   = EXCLUDED.kecamatan,
-                propinsi    = EXCLUDED.propinsi,
-                hp          = EXCLUDED.hp,
-                piutang     = EXCLUDED.piutang,
-                plafon      = EXCLUDED.plafon,
-                teks_cari   = EXCLUDED.teks_cari,
-                embedding   = EXCLUDED.embedding,
-                updated_at  = NOW()
+                kodetoko=EXCLUDED.kodetoko, namatoko=EXCLUDED.namatoko,
+                alamat=EXCLUDED.alamat, kota=EXCLUDED.kota,
+                kecamatan=EXCLUDED.kecamatan, propinsi=EXCLUDED.propinsi,
+                hp=EXCLUDED.hp, piutang=EXCLUDED.piutang, plafon=EXCLUDED.plafon,
+                teks_cari=EXCLUDED.teks_cari, embedding=EXCLUDED.embedding,
+                updated_at=NOW()
             """,
-            int(toko["id"]),
-            toko.get("kodetoko"),
-            toko.get("namatoko"),
-            toko.get("alamat"),
-            toko.get("kota"),
-            toko.get("kecamatan"),
-            toko.get("propinsi"),
-            toko.get("hp"),
-            float(toko.get("piutangb") or 0),
-            float(toko.get("plafon") or 0),
-            teks_cari,
-            str(embedding),
+            int(toko["id"]), toko.get("kodetoko"), toko.get("namatoko"),
+            toko.get("alamat"), toko.get("kota"), toko.get("kecamatan"),
+            toko.get("propinsi"), toko.get("hp"),
+            float(toko.get("piutangb") or 0), float(toko.get("plafon") or 0),
+            teks_cari, str(embedding),
         )
 
 
 async def upsert_produk(produk: dict) -> None:
-    """Insert atau update satu produk ke vector store."""
+    # ── STEP 1: Sanitasi Data Master ──
+    # Kita bersihkan setiap kolom sebelum digabung untuk pencarian (teks_cari)
+    # maupun untuk disimpan mentahnya di database vector.
+    raw_fields = {
+        "namabarang": clean_for_json(produk.get("namabarang", "")),
+        "kodebarang": clean_for_json(produk.get("kodebarang", "")),
+        "brandproduct": clean_for_json(produk.get("brandproduct", "")),
+        "merkkendaraan": clean_for_json(produk.get("merkkendaraan", "")),
+        "typekendaraan": clean_for_json(produk.get("typekendaraan", "")),
+        "kendaraan": clean_for_json(produk.get("kendaraan", "")),
+        "kategori": clean_for_json(produk.get("kategori", "")),
+        "partno": clean_for_json(produk.get("partno", "")),
+        "satuan": clean_for_json(produk.get("satuan", "pcs"))
+    }
+
+    # ── STEP 2: Gabungkan untuk Embedding ──
     teks_cari = " ".join(filter(None, [
-        produk.get("namabarang", ""),
-        produk.get("kodebarang", ""),
-        produk.get("brandproduct", ""),
-        produk.get("merkkendaraan", ""),
-        produk.get("typekendaraan", ""),
-        produk.get("kendaraan", ""),
-        produk.get("kategori", ""),
-        produk.get("partno", ""),
+        raw_fields["namabarang"], raw_fields["kodebarang"],
+        raw_fields["brandproduct"], raw_fields["merkkendaraan"],
+        raw_fields["typekendaraan"], raw_fields["kendaraan"],
+        raw_fields["kategori"], raw_fields["partno"],
     ]))
 
-    embedding = await embed_text(teks_cari)
+    # Ambil embedding (ini yang tadi error karena JSON rusak)
+    embedding = await embed_text(teks_cari, provider=get_provider_produk())
+    
+    # ── STEP 3: Simpan ke Database Vector (.221) ──
     table = get_table_produk()
     pool = await get_vector_pool()
 
@@ -345,29 +339,23 @@ async def upsert_produk(produk: dict) -> None:
                  partno, teks_cari, embedding, updated_at)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::vector,NOW())
             ON CONFLICT (stock_id) DO UPDATE SET
-                kodebarang      = EXCLUDED.kodebarang,
-                namabarang      = EXCLUDED.namabarang,
-                satuan          = EXCLUDED.satuan,
-                kategori        = EXCLUDED.kategori,
-                brandproduct    = EXCLUDED.brandproduct,
-                merkkendaraan   = EXCLUDED.merkkendaraan,
-                typekendaraan   = EXCLUDED.typekendaraan,
-                kendaraan       = EXCLUDED.kendaraan,
-                partno          = EXCLUDED.partno,
-                teks_cari       = EXCLUDED.teks_cari,
-                embedding       = EXCLUDED.embedding,
-                updated_at      = NOW()
+                kodebarang=EXCLUDED.kodebarang, namabarang=EXCLUDED.namabarang,
+                satuan=EXCLUDED.satuan, kategori=EXCLUDED.kategori,
+                brandproduct=EXCLUDED.brandproduct, merkkendaraan=EXCLUDED.merkkendaraan,
+                typekendaraan=EXCLUDED.typekendaraan, kendaraan=EXCLUDED.kendaraan,
+                partno=EXCLUDED.partno, teks_cari=EXCLUDED.teks_cari,
+                embedding=EXCLUDED.embedding, updated_at=NOW()
             """,
-            produk["id"],
-            produk.get("kodebarang"),
-            produk.get("namabarang"),
-            produk.get("satuan"),
-            produk.get("kategori"),
-            produk.get("brandproduct"),
-            produk.get("merkkendaraan"),
-            produk.get("typekendaraan"),
-            produk.get("kendaraan"),
-            produk.get("partno"),
-            teks_cari,
+            produk["id"], 
+            raw_fields["kodebarang"], 
+            raw_fields["namabarang"],
+            raw_fields["satuan"], 
+            raw_fields["kategori"], 
+            raw_fields["brandproduct"],
+            raw_fields["merkkendaraan"], 
+            raw_fields["typekendaraan"],
+            raw_fields["kendaraan"], 
+            raw_fields["partno"],
+            teks_cari, 
             str(embedding),
         )

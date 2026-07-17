@@ -3,6 +3,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.settings import get_settings
 from app.core.logging import get_logger
 from app.core.phone import to_waha_id
+from app.core.phone import resolve_waha_id, from_waha_id, normalize_phone, _waha_id_cache
+
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -35,46 +37,47 @@ class WAHAClient:
     )
 
     async def send_text(self, wa_number: str, text: str) -> dict:
-        """Kirim pesan teks biasa."""
-        chat_id = to_waha_id(wa_number)
         
-        # Log untuk memastikan kita menembak URL yang benar
-        logger.info(f"DEBUG: Menembak ke {self.base_url}/api/sendText")
-        
+        chat_id = await resolve_waha_id(wa_number)
+    
         async with httpx.AsyncClient(headers=self.headers, timeout=15) as client:
             try:
                 resp = await client.post(
                     f"{self.base_url}/api/sendText",
-                    json={
-                        "session": self.session,
-                        "chatId": chat_id,
-                        "text": text,
-                    },
+                    json={"session": self.session, "chatId": chat_id, "text": text},
                 )
-                
-                # Jika status bukan 200/201, cetak pesan error aslinya dari VPS
+
                 if resp.status_code not in [200, 201]:
-                    logger.error(f"WAHA_ERROR: Status {resp.status_code} - Detail: {resp.text}")
+                    logger.error(f"WAHA_ERROR: Status {resp.status_code} - {resp.text}")
                     return {"status": "error", "code": resp.status_code}
 
-                # Pastikan ada konten sebelum di-parse ke JSON
                 if not resp.content:
                     logger.warning("WAHA_WARNING: Server menjawab dengan body kosong")
                     return {"status": "ok", "detail": "empty_response"}
 
-                logger.info("message_sent", to=wa_number, length=len(text))
-                return resp.json()
+                # Simpan @lid ID dari response ke cache
+                data = resp.json()
+                remote_lid = data.get("_data", {}).get("id", {}).get("remote")
+                if remote_lid and "@lid" in remote_lid:
+                    normalized = normalize_phone(wa_number)
+                    from app.core.phone import _waha_id_cache
+                    _waha_id_cache[normalized] = remote_lid
+                    logger.info("waha_id_updated_from_response", 
+                            phone=normalized, chat_id=remote_lid)
+
+                logger.info("message_sent", to=from_waha_id(chat_id), length=len(text))
+                return data
 
             except httpx.HTTPError as e:
-                logger.error(f"NETWORK_ERROR: Gagal terhubung ke VPS: {str(e)}")
-                raise  # Biarkan @retry bekerja jika terjadi gangguan jaringan
+                logger.error(f"NETWORK_ERROR: {str(e)}")
+                raise
 
     async def send_typing(self, wa_number: str, duration_ms: int = 2000) -> None:
         """
         Tampilkan indikator 'mengetik...' sebelum kirim pesan.
         Membuat interaksi terasa lebih natural.
         """
-        chat_id = to_waha_id(wa_number)
+        chat_id = await resolve_waha_id(wa_number)
         async with httpx.AsyncClient(headers=self.headers, timeout=10) as client:
             await client.post(
                 f"{self.base_url}/api/startTyping",
@@ -123,3 +126,16 @@ class WAHAClient:
         except Exception as e:
             logger.warning("waha_connection_check_failed", error=str(e))
             return False
+
+
+# ── Provider factory ─────────────────────────────────────────────
+
+from app.services.whatsapp.base import WhatsAppClient  # noqa: E402
+from app.services.whatsapp.evolution import EvolutionClient  # noqa: E402
+
+
+def get_wa_client() -> WhatsAppClient:
+    """Pilih implementasi client sesuai settings.wa_provider."""
+    if settings.wa_provider.lower() == "evolution":
+        return EvolutionClient()
+    return WAHAClient()

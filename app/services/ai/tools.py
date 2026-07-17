@@ -118,13 +118,21 @@ ADMIN_TOOLS = [
         "type": "function",
         "function": {
             "name": "cek_stok",
-            "description": "Cek ketersediaan stok produk.",
+            "description": (
+                "Cek ketersediaan stok produk untuk toko tertentu. "
+                "Stok dihitung hanya dari gudang/cabang yang melayani propinsi toko, "
+                "jadi WAJIB sertakan toko_id dari final order."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "product_code": {"type": "string"},
+                    "toko_id": {
+                        "type": "string",
+                        "description": "ID toko yang order (dari pesan final order admin)",
+                    },
                 },
-                "required": ["product_code"],
+                "required": ["product_code", "toko_id"],
             },
         },
     },

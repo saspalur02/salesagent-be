@@ -33,10 +33,26 @@ class SalesAgent:
         message: str,
         wa_number: str,
         history: list[dict],
+        toko: dict | None = None,
     ) -> str:
-        """Proses pesan dari toko — susun draft order."""
-        executor = TokoToolExecutor(self.erp, wa_number)
+        """Proses pesan dari toko — susun draft order.
+
+        Jika `toko` sudah teridentifikasi dari nomor WA, datanya di-inject ke
+        konteks agar agent tidak menanyakan nama/alamat lagi.
+        """
+        executor = TokoToolExecutor(self.erp, wa_number, toko=toko)
         messages = [{"role": "system", "content": TOKO_AGENT_PROMPT}]
+        if toko:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Toko sudah teridentifikasi dari nomor WhatsApp. "
+                    "JANGAN tanya nama/alamat toko dan JANGAN panggil tool cari_toko. "
+                    f"Data toko: toko_id={toko['toko_id']}, nama={toko['name']}, "
+                    f"alamat={toko['address']}. "
+                    "Gunakan toko_id ini saat memanggil kirim_ke_admin."
+                ),
+            })
         messages.extend(history[-20:])
         messages.append({"role": "user", "content": message})
         return await self._run(messages, TOKO_TOOLS, executor)

@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.settings import get_settings
 from app.core.logging import setup_logging, get_logger
-from app.db.database import engine, Base
+from app.db.database import engine
 from app.db.redis_client import get_redis
 from app.api.routes import webhook, health
 
@@ -18,9 +18,9 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("starting wa-sales-agent", env=settings.app_env)
 
-    # Buat tabel DB kalau belum ada
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # CATATAN: Tabel TIDAK dibuat otomatis dari aplikasi.
+    # Skema dikelola manual via scripts/create_tables.sql (jalankan di pgAdmin).
+    # Tidak ada create_all / drop_all saat startup.
 
     # Test koneksi Redis
     redis = await get_redis()

@@ -12,7 +12,7 @@ Gunakan tool `cari_toko` untuk mencari di database.
 Setelah toko dikenal, bantu toko mencari dan memesan spare part:
 - Toko bisa menyebut kode part (contoh: NA2000089533) ATAU nama part + kendaraan (contoh: kampas rem Vario 125)
 - Gunakan tool `cari_produk` untuk mencari di database
-- Jika hasil pencarian banyak, tampilkan maksimal 5 dan minta konfirmasi
+- Jika hasil pencarian banyak, tampilkan maksimal 50 dan minta konfirmasi
 - Tanya jumlah (qty) dan satuan untuk setiap part
 - Bisa order banyak part sekaligus
 
@@ -60,7 +60,8 @@ Admin penjualan menerima draft order dari toko via WhatsApp, berkomunikasi langs
 Saat admin mengirim pesan final order:
 1. Parse detail order dari pesan admin (format bebas)
 2. Gunakan tool `cari_produk` untuk validasi kode part
-3. Gunakan tool `cek_stok` untuk cek ketersediaan
+3. Gunakan tool `cek_stok` untuk cek ketersediaan — WAJIB sertakan `toko_id` dari
+   pesan order, karena stok dihitung per gudang/cabang yang melayani propinsi toko
 4. Konfirmasi detail ke admin sebelum buat SO
 5. Gunakan tool `buat_sales_order` untuk buat SO di ERP
 6. Informasikan nomor SO ke admin
@@ -80,4 +81,6 @@ atau format bebas:
 - Cek stok — informasikan ke admin jika stok tidak cukup
 - Setelah SO dibuat, berikan nomor SO ke admin
 - Format harga: Rp 45.000 (bukan 45rb)
+- PENTING: harga yang diberikan admin adalah harga satuan yang SUDAH TERMASUK PPN 11%.
+  Kirim harga apa adanya ke `buat_sales_order` (sistem yang memisahkan pajaknya).
 """

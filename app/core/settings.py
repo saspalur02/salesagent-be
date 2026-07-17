@@ -16,11 +16,19 @@ class Settings(BaseSettings):
     app_port: int = 8000
     log_level: str = "INFO"
 
+    # WhatsApp provider switch: "waha" | "evolution"
+    wa_provider: str = "waha"
+
     # WAHA
     waha_base_url: str = "http://localhost:3000"
     waha_api_key: str = ""
     waha_session: str = "default"
     waha_webhook_secret: str = ""
+
+    # Evolution API
+    evolution_base_url: str = "http://localhost:8080"
+    evolution_api_key: str = ""
+    evolution_instance: str = ""
 
     # Admin penjualan
     admin_wa_numbers: str = ""
@@ -32,11 +40,13 @@ class Settings(BaseSettings):
     litellm_max_tokens: int = 8000
     litellm_temperature: float = 0.2
 
-    # Embedding provider: "huggingface" atau "litellm"
-    embedding_provider: str = "litellm"
+    # Embedding provider per entity
+    # Pilihan: "huggingface" atau "litellm"
+    embedding_provider_toko: str = "huggingface"
+    embedding_provider_produk: str = "litellm"
 
     # LiteLLM embedding config
-    embedding_model: str = "gemini/gemini-embedding-001"
+    embedding_model: str = "openai/text-embedding-3-small"
     embedding_api_base: str = ""
     embedding_api_key: str = ""
 
@@ -57,6 +67,18 @@ class Settings(BaseSettings):
 
     # ERP Database Server 2 (batch.rekapstocktoday)
     erp_batch_db_url: str = ""
+
+    # Wiser / Custom ERP — push final order (Order Pembelian tambahapi)
+    wiser_api_url: str = (
+        "http://wisertasksales.sas-autoparts.com/api/transaksi/orderpembelian/tambahapi"
+    )
+    wiser_api_key: str = ""
+    wiser_sotype: str = "TSSO"
+    wiser_currency: str = "IDR"
+    wiser_status_bmk: str = "RETAIL25"   # default tasksalestokostatusbmk untuk order AI
+    wiser_kodesales: str = "AI-BOT"      # kode sales tetap untuk order dari AI Agent
+    wiser_ppn_rate: float = 0.11         # harga input admin sudah termasuk PPN 11%
+    wiser_timeout: int = 30
 
     @property
     def is_production(self) -> bool:

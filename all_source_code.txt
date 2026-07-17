@@ -1,0 +1,2942 @@
+STRUCTURE DIRECTORY:
+==================================================
+app/
+    main.py
+    __init__.py
+    api/
+        __init__.py
+        routes/
+            health.py
+            webhook.py
+            __init__.py
+    core/
+        logging.py
+        phone.py
+        settings.py
+        __init__.py
+    db/
+        database.py
+        redis_client.py
+        __init__.py
+    models/
+        customer.py
+        webhook.py
+        __init__.py
+    services/
+        identity.py
+        __init__.py
+        ai/
+            executor.py
+            prompt.py
+            tools.py
+            __init__.py
+        erp/
+            parser.py
+            toko.py
+            __init__.py
+        vector/
+            __init__.py
+        whatsapp/
+            __init__.py
+        {whatsapp,erp,ai,vector}/
+scripts/
+    debug_vector_toko.py
+    setup_vector_tables.sql
+    sync_embeddings.py
+
+==================================================
+FULL SOURCE CODE CONTENT:
+==================================================
+
+############################################################
+LOCATION: app\main.py
+############################################################
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.settings import get_settings
+from app.core.logging import setup_logging, get_logger
+from app.db.database import engine, Base
+from app.db.redis_client import get_redis
+from app.api.routes import webhook, health
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──────────────────────────────────────
+    setup_logging()
+    logger.info("starting wa-sales-agent", env=settings.app_env)
+
+    # Buat tabel DB kalau belum ada
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Test koneksi Redis
+    redis = await get_redis()
+    await redis.ping()
+    logger.info("redis connected")
+
+    yield
+
+    # ── Shutdown ─────────────────────────────────────
+    await engine.dispose()
+    logger.info("shutdown complete")
+
+
+app = FastAPI(
+    title="WA Sales Agent",
+    description="AI Agent WhatsApp → ERP Sales Order",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if not settings.is_production else None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if not settings.is_production else [],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(health.router, tags=["health"])
+app.include_router(webhook.router, prefix="/webhook", tags=["webhook"])
+
+
+############################################################
+LOCATION: app\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\api\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\api\routes\health.py
+############################################################
+
+from fastapi import APIRouter
+from app.db.redis_client import get_redis
+
+router = APIRouter()
+
+
+@router.get("/health")
+async def health():
+    redis = await get_redis()
+    redis_ok = await redis.ping()
+    return {
+        "status": "ok",
+        "redis": "ok" if redis_ok else "error",
+    }
+
+
+############################################################
+LOCATION: app\api\routes\webhook.py
+############################################################
+
+import json
+from fastapi import APIRouter, Request, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+from app.core.phone import normalize_phone, cache_waha_id, get_real_phone
+from app.db.database import get_db
+from app.db.redis_client import get_redis, SessionStore
+from app.models.webhook import WAHAPayload
+from app.services.whatsapp import WAHAClient
+from app.services.erp import ERPClient
+from app.services.ai import SalesAgent
+
+
+settings = get_settings()
+logger = get_logger(__name__)
+router = APIRouter()
+
+MAX_HISTORY = 20
+
+MSG_WELCOME = (
+    "Halo! Selamat datang 👋\n\n"
+    "Saya asisten pemesanan spare part kendaraan.\n"
+    "Boleh saya tahu *nama toko* dan *alamat* Anda?"
+)
+MSG_NOT_TEXT = (
+    "Maaf, saya hanya bisa memproses pesan teks.\n"
+    "Silakan ketik pesanan Anda."
+)
+MSG_ERROR = "Maaf, terjadi gangguan. Silakan coba beberapa saat lagi."
+
+
+@router.post("/waha")
+async def waha_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    raw = await request.body()
+    print("=== RAW PAYLOAD ===")
+    print(raw.decode())
+    print("===================")
+
+    try:
+        payload_dict = await request.json()
+        waha = WAHAPayload(**payload_dict)
+    except Exception as e:
+        logger.warning("webhook_parse_error", error=str(e))
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    # Cache @lid ID dari pesan masuk
+    raw_from = payload_dict.get("payload", {}).get("from", "")
+    cache_waha_id(raw_from)
+
+    print(f"EVENT: {waha.event}")
+    print(f"FROM_ME: {waha.is_from_me()}")
+    print(f"IS_GROUP: {waha.is_group_message()}")
+    print(f"WA_NUMBER: {waha.get_wa_number()}")
+    print(f"TYPE: {waha.get_message_type()}")
+    print(f"BODY: {waha.get_message_body()}")
+
+    if waha.event != "message":
+        print(f"FILTERED: event={waha.event}")
+        return {"status": "ignored", "reason": f"event={waha.event}"}
+    if waha.is_from_me():
+        print("FILTERED: from_me")
+        return {"status": "ignored", "reason": "from_me"}
+    if waha.is_group_message():
+        print("FILTERED: group")
+        return {"status": "ignored", "reason": "group_message"}
+
+    wa_number = waha.get_wa_number()
+    # HOTFIX: Jika get_wa_number gagal, ambil manual dari payload raw
+    if not wa_number:
+        wa_number = payload_dict.get("payload", {}).get("from")
+        if wa_number and "@" in wa_number:
+            wa_number = wa_number.split("@")[0]
+        print(f"DEBUG: Hotfix WA_NUMBER manual -> {wa_number}")
+
+    if not wa_number:
+        return {"status": "ignored", "reason": "no_number"}
+
+    # Resolve ke nomor HP asli dari @lid
+    if raw_from:
+        wa_number = await get_real_phone(raw_from)
+        print(f"DEBUG: Real phone resolved -> {wa_number}")
+
+    message_type = waha.get_message_type()
+    message_body = waha.get_message_body()
+
+    if message_type != "chat" or not message_body:
+        waha_client = WAHAClient()
+        await waha_client.send_text(wa_number, MSG_NOT_TEXT)
+        return {"status": "ok"}
+
+    logger.info("message_received", wa_number=wa_number)
+
+    # ── Init services ────────────────────────────────────────────
+    waha_client = WAHAClient()
+    erp_client = ERPClient()
+    redis = await get_redis()
+    session_store = SessionStore(redis)
+    agent = SalesAgent(erp_client)
+
+    # ── Deteksi: admin atau toko? ────────────────────────────────
+    is_admin = wa_number in settings.admin_wa_list
+
+    if is_admin:
+        await _handle_admin(
+            wa_number, message_body,
+            agent, waha_client, session_store
+        )
+    else:
+        await _handle_toko(
+            wa_number, message_body,
+            agent, waha_client, session_store
+        )
+
+    return {"status": "ok"}
+
+
+async def _handle_admin(
+    wa_number: str,
+    message: str,
+    agent: SalesAgent,
+    waha_client: WAHAClient,
+    session_store: SessionStore,
+) -> None:
+    """Handle pesan dari admin penjualan."""
+    session = await session_store.get(f"admin:{wa_number}") or {}
+    history = session.get("history", [])
+
+    logger.info("admin_message", wa_number=wa_number)
+
+    try:
+        response = await agent.process_admin(
+            message=message,
+            history=history,
+        )
+    except Exception as e:
+        logger.error("admin_agent_error", error=str(e))
+        await waha_client.send_text(wa_number, MSG_ERROR)
+        return
+
+    await waha_client.send_text_with_typing(wa_number, response)
+
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": response})
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
+    await session_store.update(f"admin:{wa_number}", {"history": history})
+
+
+async def _handle_toko(
+    wa_number: str,
+    message: str,
+    agent: SalesAgent,
+    waha_client: WAHAClient,
+    session_store: SessionStore,
+) -> None:
+    """Handle pesan dari toko."""
+    session = await session_store.get(wa_number) or {}
+    history = session.get("history", [])
+
+    # Pesan pertama — sambut user
+    if not history:
+        await waha_client.send_text_with_typing(wa_number, MSG_WELCOME)
+        await session_store.set(wa_number, {"history": [], "state": "new"})
+        history = []
+
+    logger.info("toko_message", wa_number=wa_number)
+
+    try:
+        response = await agent.process_toko(
+            message=message,
+            wa_number=wa_number,
+            history=history,
+        )
+    except Exception as e:
+        logger.error("toko_agent_error", error=str(e))
+        await waha_client.send_text(wa_number, MSG_ERROR)
+        return
+
+    await waha_client.send_text_with_typing(wa_number, response)
+
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": response})
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
+    await session_store.update(wa_number, {"history": history})
+    await session_store.extend_ttl(wa_number)
+
+############################################################
+LOCATION: app\api\routes\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\core\logging.py
+############################################################
+
+import structlog
+import logging
+from app.core.settings import get_settings
+
+
+def setup_logging() -> None:
+    settings = get_settings()
+
+    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer()
+            if not settings.is_production
+            else structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+
+
+def get_logger(name: str = __name__):
+    return structlog.get_logger(name)
+
+
+############################################################
+LOCATION: app\core\phone.py
+############################################################
+
+import re
+import httpx
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+# Cache in-memory: nomor HP → chat ID (@lid atau @c.us)
+# Di-populate dari 2 sumber:
+#   1. Pesan masuk dari WAHA (via cache_waha_id)
+#   2. Lookup via WAHA contacts API
+_waha_id_cache: dict[str, str] = {}
+
+
+def normalize_phone(number: str) -> str:
+    """Bersihkan nomor HP jadi format 628xxx."""
+    if "@" in number:
+        return number.split("@")[0]
+    digits = re.sub(r"\D", "", number)
+    if digits.startswith("0"):
+        digits = "62" + digits[1:]
+    return digits
+
+
+def to_waha_id(number: str) -> str:
+    """Konversi nomor ke format @lid."""
+    if "@" in number:
+        return number
+    return f"{normalize_phone(number)}@lid"
+
+
+def from_waha_id(waha_id: str) -> str:
+    """Ekstrak nomor dari format @c.us atau @lid."""
+    return waha_id.split("@")[0]
+
+
+def cache_waha_id(raw_from: str) -> None:
+    if not raw_from or "@" not in raw_from:
+        return
+    if "@g.us" in raw_from:
+        return
+    number = raw_from.split("@")[0]
+    if number:
+        _waha_id_cache[number] = raw_from  # selalu update
+        logger.info("waha_id_cached", phone=number, chat_id=raw_from)
+
+
+async def resolve_waha_id(phone: str) -> str:
+    """
+    Resolve nomor HP ke chat ID yang benar.
+
+    Prioritas:
+    1. Kalau sudah ada @, langsung return (sudah berupa ID)
+    2. Cek cache — bisa berisi @lid (dari pesan masuk) atau @c.us
+    3. Lookup via WAHA contacts API — cek apakah ada @lid
+    4. Fallback ke @c.us
+    """
+    from app.core.settings import get_settings
+    settings = get_settings()
+
+    # Sudah berupa chat ID
+    if "@" in phone:
+        return phone
+
+    normalized = normalize_phone(phone)
+
+    # Cek cache — prioritaskan @lid kalau ada
+    if normalized in _waha_id_cache:
+        cached = _waha_id_cache[normalized]
+        logger.info("waha_id_from_cache", phone=normalized, chat_id=cached)
+        return cached
+
+    # Lookup via WAHA contacts API
+    try:
+        async with httpx.AsyncClient(
+            headers={
+                "Content-Type": "application/json",
+                "X-Api-Key": settings.waha_api_key,
+            },
+            timeout=10,
+        ) as client:
+            resp = await client.get(
+                f"{settings.waha_base_url}/api/contacts",
+                params={
+                    "session": settings.waha_session,
+                    "contactId": f"{normalized}@c.us",
+                },
+            )
+
+            print(f"DEBUG CONTACTS STATUS: {resp.status_code}")
+            print(f"DEBUG CONTACTS RESPONSE: {data}")
+        
+            if resp.status_code == 200:
+                data = resp.json()
+                # Cek apakah ada @lid field di response
+                lid = data.get("lid")
+                chat_id = f"{lid}@lid" if lid else data.get("id")
+                if chat_id:
+                    _waha_id_cache[normalized] = chat_id
+                    logger.info("waha_id_resolved", phone=normalized, chat_id=chat_id)
+                    return chat_id
+
+    except Exception as e:
+        logger.warning("waha_id_resolve_failed", phone=normalized, error=str(e))
+
+    # Fallback ke @c.us
+    fallback = f"{normalized}@c.us"
+    logger.warning("waha_id_fallback", phone=normalized, fallback=fallback)
+    _waha_id_cache[normalized] = fallback
+    return fallback
+
+
+def clear_waha_id_cache():
+    """Clear cache — pakai kalau ada perubahan nomor."""
+    _waha_id_cache.clear()
+
+# Cache mapping @lid → nomor HP asli
+_lid_to_phone_cache: dict[str, str] = {}
+
+async def get_real_phone(waha_id: str) -> str:
+    """
+    Lookup nomor HP asli dari @lid ID via WAHA contacts API.
+    Returns nomor HP murni: "62818835535"
+    """
+    from app.core.settings import get_settings
+    settings = get_settings()
+
+    # Kalau tidak ada @, sudah nomor HP
+    if "@" not in waha_id:
+        return waha_id
+
+    # Cek cache dulu
+    if waha_id in _lid_to_phone_cache:
+        return _lid_to_phone_cache[waha_id]
+
+    try:
+        async with httpx.AsyncClient(
+            headers={
+                "Content-Type": "application/json",
+                "X-Api-Key": settings.waha_api_key,
+            },
+            timeout=10,
+        ) as client:
+            resp = await client.get(
+                f"{settings.waha_base_url}/api/contacts",
+                params={
+                    "session": settings.waha_session,
+                    "contactId": waha_id,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                number = data.get("number")
+                if number:
+                    _lid_to_phone_cache[waha_id] = number
+                    logger.info("real_phone_resolved", waha_id=waha_id, phone=number)
+                    return number
+    except Exception as e:
+        logger.warning("real_phone_resolve_failed", waha_id=waha_id, error=str(e))
+
+    # Fallback — strip @lid
+    return waha_id.split("@")[0]
+
+############################################################
+LOCATION: app\core\settings.py
+############################################################
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # App
+    app_env: str = "development"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+    log_level: str = "INFO"
+
+    # WAHA
+    waha_base_url: str = "http://localhost:3000"
+    waha_api_key: str = ""
+    waha_session: str = "default"
+    waha_webhook_secret: str = ""
+
+    # Admin penjualan
+    admin_wa_numbers: str = ""
+
+    # LiteLLM (chat)
+    litellm_model: str = "openai/gemini-2.5-flash"
+    litellm_api_key: str = ""
+    litellm_api_base: str = ""
+    litellm_max_tokens: int = 8000
+    litellm_temperature: float = 0.2
+
+    # Embedding provider per entity
+    # Pilihan: "huggingface" atau "litellm"
+    embedding_provider_toko: str = "huggingface"
+    embedding_provider_produk: str = "litellm"
+
+    # LiteLLM embedding config
+    embedding_model: str = "openai/text-embedding-3-small"
+    embedding_api_base: str = ""
+    embedding_api_key: str = ""
+
+    # Database lokal (AI Agent)
+    database_url: str = ""
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+
+    # Redis
+    redis_url: str = "redis://localhost:6379/0"
+    session_ttl_seconds: int = 86400
+
+    # pgvector
+    pgvector_url: str = ""
+
+    # ERP Database Server 1 (mstr.toko + mstr.stock)
+    erp_db_url: str = ""
+
+    # ERP Database Server 2 (batch.rekapstocktoday)
+    erp_batch_db_url: str = ""
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+    @property
+    def admin_wa_list(self) -> list[str]:
+        if not self.admin_wa_numbers:
+            return []
+        return [n.strip() for n in self.admin_wa_numbers.split(",") if n.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+############################################################
+LOCATION: app\core\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\db\database.py
+############################################################
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+from app.core.settings import get_settings
+
+settings = get_settings()
+
+engine = create_async_engine(
+    settings.database_url,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    echo=not settings.is_production,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+
+############################################################
+LOCATION: app\db\redis_client.py
+############################################################
+
+import json
+import redis.asyncio as aioredis
+from typing import Any
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+settings = get_settings()
+
+_redis_client: aioredis.Redis | None = None
+
+
+async def get_redis() -> aioredis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = await aioredis.from_url(
+            settings.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+    return _redis_client
+
+
+class SessionStore:
+    """
+    Menyimpan konteks percakapan per nomor WhatsApp.
+    Key pattern: session:{wa_number}
+    """
+
+    PREFIX = "session"
+    TTL = settings.session_ttl_seconds
+
+    def __init__(self, redis: aioredis.Redis):
+        self.redis = redis
+
+    def _key(self, wa_number: str) -> str:
+        # Normalisasi nomor dulu sebelum dijadikan key
+        normalized = wa_number.lstrip("+").replace("-", "").replace(" ", "")
+        return f"{self.PREFIX}:{normalized}"
+
+    async def get(self, wa_number: str) -> dict | None:
+        raw = await self.redis.get(self._key(wa_number))
+        if raw:
+            return json.loads(raw)
+        return None
+
+    async def set(self, wa_number: str, data: dict) -> None:
+        await self.redis.setex(
+            self._key(wa_number),
+            self.TTL,
+            json.dumps(data, ensure_ascii=False),
+        )
+
+    async def update(self, wa_number: str, updates: dict) -> dict:
+        existing = await self.get(wa_number) or {}
+        existing.update(updates)
+        await self.set(wa_number, existing)
+        return existing
+
+    async def delete(self, wa_number: str) -> None:
+        await self.redis.delete(self._key(wa_number))
+
+    async def extend_ttl(self, wa_number: str) -> None:
+        await self.redis.expire(self._key(wa_number), self.TTL)
+
+
+############################################################
+LOCATION: app\db\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\models\customer.py
+############################################################
+
+from datetime import datetime
+from sqlalchemy import String, Boolean, DateTime, Text, Integer, JSON, func
+from sqlalchemy.orm import Mapped, mapped_column
+from app.db.database import Base
+
+
+class WACustomerMap(Base):
+    """
+    Mapping nomor WhatsApp → toko_id di ERP.
+    Disimpan setelah toko berhasil diidentifikasi
+    supaya tidak perlu tanya ulang di percakapan berikutnya.
+    """
+    __tablename__ = "wa_customer_map"
+
+    wa_number: Mapped[str] = mapped_column(String(20), primary_key=True)
+    toko_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    toko_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    toko_address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DraftOrder(Base):
+    """
+    Menyimpan draft order sementara sambil menunggu
+    finalisasi dari admin penjualan.
+    """
+    __tablename__ = "draft_order"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wa_number: Mapped[str] = mapped_column(String(20), index=True)
+    toko_id: Mapped[str] = mapped_column(String(50), index=True)
+    toko_name: Mapped[str] = mapped_column(String(200))
+    toko_address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    items: Mapped[dict] = mapped_column(JSON)         # list item order
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending"
+    )  # pending | finalized | cancelled
+    admin_wa: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    so_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ConversationLog(Base):
+    """Log percakapan untuk audit trail."""
+    __tablename__ = "conversation_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wa_number: Mapped[str] = mapped_column(String(20), index=True)
+    toko_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    role: Mapped[str] = mapped_column(String(10))     # user | assistant
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+############################################################
+LOCATION: app\models\webhook.py
+############################################################
+
+from pydantic import BaseModel, Field
+from typing import Any
+
+
+class WAHAContact(BaseModel):
+    id: str
+    name: str | None = None
+    pushname: str | None = None
+
+
+class WAHAMessage(BaseModel):
+    id: str
+    timestamp: int
+    from_: str = Field(alias="_data")
+    body: str | None = None
+    type: str = "chat"
+    hasMedia: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class WAHAPayload(BaseModel):
+    """Payload standar dari WAHA webhook."""
+    event: str
+    session: str
+    me: dict | None = None
+    payload: dict = {}
+
+    def get_wa_number(self) -> str | None:
+        """Ekstrak nomor pengirim — handle @c.us dan @lid."""
+        from_ = self.payload.get("from", "")
+        if "@c.us" in from_ or "@lid" in from_:
+            return from_.split("@")[0]
+        return None
+
+    def get_message_body(self) -> str | None:
+        return self.payload.get("body")
+
+    def get_message_type(self) -> str:
+        return self.payload.get("type", "chat")
+
+    def is_from_me(self) -> bool:
+        return self.payload.get("fromMe", False)
+
+    def is_group_message(self) -> bool:
+        from_ = self.payload.get("from", "")
+        return "@g.us" in from_
+
+
+############################################################
+LOCATION: app\models\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\services\identity.py
+############################################################
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.customer import WACustomerMap
+from app.core.phone import normalize_phone
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class IdentityService:
+    """
+    Resolve nomor WhatsApp → customer_id ERP.
+
+    Urutan lookup:
+      1. Cek tabel wa_customer_map (cache lokal di DB kita)
+      2. Kalau tidak ada, query ERP by phone number
+      3. Kalau ketemu di ERP, simpan ke wa_customer_map
+      4. Kalau tidak ketemu di mana-mana, return None (unknown user)
+    """
+
+    def __init__(self, db: AsyncSession, erp_client):
+        self.db = db
+        self.erp = erp_client
+
+    async def resolve(self, wa_number: str) -> WACustomerMap | None:
+        """
+        Resolve nomor WA ke customer. Return WACustomerMap atau None.
+        """
+        normalized = normalize_phone(wa_number)
+
+        # ── Step 1: cek local map ────────────────────────────────
+        result = await self.db.execute(
+            select(WACustomerMap).where(WACustomerMap.wa_number == normalized)
+        )
+        mapping = result.scalar_one_or_none()
+
+        if mapping:
+            logger.info("customer_resolved_from_map",
+                        wa_number=normalized,
+                        customer_id=mapping.customer_id)
+            return mapping
+
+        # ── Step 2: query ERP by phone ───────────────────────────
+        logger.info("customer_not_in_map_querying_erp", wa_number=normalized)
+        erp_customer = await self.erp.find_customer_by_phone(normalized)
+
+        if not erp_customer:
+            logger.info("customer_not_found_in_erp", wa_number=normalized)
+            return None
+
+        # ── Step 3: simpan ke local map ──────────────────────────
+        mapping = WACustomerMap(
+            wa_number=normalized,
+            customer_id=erp_customer["id"],
+            customer_name=erp_customer["name"],
+            contact_name=erp_customer.get("contact_name"),
+            is_verified=True,
+        )
+        self.db.add(mapping)
+        await self.db.commit()
+        await self.db.refresh(mapping)
+
+        logger.info("customer_mapped",
+                    wa_number=normalized,
+                    customer_id=mapping.customer_id)
+        return mapping
+
+    async def register_manual(
+        self,
+        wa_number: str,
+        customer_id: str,
+        customer_name: str,
+        contact_name: str | None = None,
+    ) -> WACustomerMap:
+        """
+        Daftarkan mapping secara manual — dipakai saat customer
+        belum terdaftar di ERP tapi sudah konfirmasi identitasnya via chat.
+        is_verified=False sampai admin konfirmasi.
+        """
+        normalized = normalize_phone(wa_number)
+        mapping = WACustomerMap(
+            wa_number=normalized,
+            customer_id=customer_id,
+            customer_name=customer_name,
+            contact_name=contact_name,
+            is_verified=False,
+        )
+        self.db.add(mapping)
+        await self.db.commit()
+        await self.db.refresh(mapping)
+        return mapping
+
+
+############################################################
+LOCATION: app\services\__init__.py
+############################################################
+
+
+
+############################################################
+LOCATION: app\services\ai\executor.py
+############################################################
+
+"""
+Tool executor — menjalankan tool yang diminta LLM.
+Handle 2 mode: toko dan admin.
+"""
+from app.core.logging import get_logger
+from app.core.settings import get_settings
+from app.services.erp import ERPClient
+from app.services.whatsapp import WAHAClient
+
+logger = get_logger(__name__)
+settings = get_settings()
+
+
+class TokoToolExecutor:
+    """Executor untuk mode toko."""
+
+    def __init__(self, erp_client: ERPClient, wa_number: str):
+        self.erp = erp_client
+        self.wa_number = wa_number
+
+    async def execute(self, tool_name: str, tool_args: dict) -> str:
+        logger.info("tool_executing", tool=tool_name, mode="toko")
+        try:
+            if tool_name == "cari_toko":
+                return await self._cari_toko(**tool_args)
+            elif tool_name == "cari_produk":
+                return await self._cari_produk(**tool_args)
+            elif tool_name == "kirim_ke_admin":
+                return await self._kirim_ke_admin(**tool_args)
+            else:
+                return f"Tool '{tool_name}' tidak dikenal."
+        except Exception as e:
+            logger.error("tool_error", tool=tool_name, error=str(e))
+            return f"Error: {str(e)}"
+
+    async def _cari_toko(self, nama_toko: str, alamat: str = "") -> str:
+        from app.services.erp.toko import find_toko_hybrid
+
+        query = f"{nama_toko} {alamat}".strip() if alamat else nama_toko
+        results = await find_toko_hybrid(query)
+
+        if not results:
+            return (
+                f"Toko '{nama_toko}' tidak ditemukan di database. "
+                "Pesanan akan dicatat dengan nama dan alamat yang Anda berikan."
+            )
+
+        # Hanya 1 hasil — langsung konfirmasi
+        if len(results) == 1:
+            t = results[0]
+            return (
+                f"Toko ditemukan:\n"
+                f"- ID: {t['toko_id']}\n"
+                f"- Nama: {t['name']}\n"
+                f"- Alamat: {t['address']}"
+            )
+
+        # Banyak hasil dengan alamat — tampilkan max 10
+        if alamat and len(results) > 1:
+            lines = [f"Ditemukan {len(results)} toko '{nama_toko}' di area tersebut:\n"]
+            for i, t in enumerate(results[:10], 1):
+                lines.append(f"{i}. {t['name']} — {t['address']}")
+            lines.append("\nMohon sebutkan alamat yang lebih spesifik.")
+            return "\n".join(lines)
+
+        # Banyak hasil tanpa alamat — minta alamat dulu, jangan kirim list ke LLM
+        kota_list = list({t["address"].split(",")[-1].strip()
+                         for t in results[:10] if t["address"]})
+        kota_sample = ", ".join(kota_list[:5])
+        return (
+            f"Ditemukan {len(results)} toko dengan nama '{nama_toko}'.\n"
+            f"Tersebar di: {kota_sample}, dll.\n\n"
+            f"Mohon sebutkan *alamat* atau *kota* toko Anda."
+        )
+
+    async def _cari_produk(self, query: str) -> str:
+        matches = await self.erp.search_products(query, limit=20)
+
+        if not matches:
+            return (
+                f"Part '{query}' tidak ditemukan.\n"
+                "Coba gunakan kata kunci lain, misalnya kode part atau nama kendaraan."
+            )
+
+        lines = [f"Ditemukan {len(matches)} opsi part yang cocok:\n"]
+        for p in matches:
+            kendaraan_info = ""
+            if p.get("merk_kendaraan") or p.get("type_kendaraan"):
+                kendaraan_info = f" | {p.get('merk_kendaraan', '')} {p.get('type_kendaraan', '')}".strip()
+            lines.append(
+                f"- [{p['code']}] {p['name']}{kendaraan_info} | {p.get('uom', 'pcs')}"
+            )
+        lines.append("\n_Mohon sebutkan nomor pilihan atau kodenya untuk memesan._")
+        return "\n".join(lines)
+
+    async def _kirim_ke_admin(
+        self,
+        toko_name: str,
+        toko_address: str,
+        items: list,
+        toko_id: str = "UNKNOWN",
+        note: str = "",
+    ) -> str:
+        lines = [
+            "🛒 *DRAFT ORDER MASUK*",
+            "",
+            f"*Toko:* {toko_name}",
+            f"*Alamat:* {toko_address}",
+            f"*Toko ID:* {toko_id}",
+            f"*WA Toko:* {self.wa_number}",
+            "",
+            "*Detail Order:*",
+        ]
+        for item in items:
+            lines.append(
+                f"- {item.get('product_name', '-')} "
+                f"x {item.get('qty', 0)} {item.get('uom', '')}"
+            )
+
+        if note:
+            lines.append(f"\n*Catatan:* {note}")
+
+        lines.append("")
+        lines.append("_Silakan konfirmasi ke toko dan kirim final order ke saya._")
+
+        pesan_admin = "\n".join(lines)
+
+        waha = WAHAClient()
+        admin_numbers = settings.admin_wa_list
+        if not admin_numbers:
+            logger.warning("no_admin_wa_configured")
+            return "Draft order tersimpan tapi nomor admin belum dikonfigurasi."
+
+        for admin_no in admin_numbers:
+            try:
+                await waha.send_text(admin_no, pesan_admin)
+                logger.info("draft_sent_to_admin", admin=admin_no, toko=toko_name)
+            except Exception as e:
+                logger.error("send_admin_failed", admin=admin_no, error=str(e))
+
+        return "Draft order berhasil dikirim ke admin penjualan."
+
+
+class AdminToolExecutor:
+    """Executor untuk mode admin."""
+
+    def __init__(self, erp_client: ERPClient):
+        self.erp = erp_client
+
+    async def execute(self, tool_name: str, tool_args: dict) -> str:
+        logger.info("tool_executing", tool=tool_name, mode="admin")
+        try:
+            if tool_name == "cari_produk":
+                return await self._cari_produk(**tool_args)
+            elif tool_name == "cek_stok":
+                return await self._cek_stok(**tool_args)
+            elif tool_name == "buat_sales_order":
+                return await self._buat_sales_order(**tool_args)
+            else:
+                return f"Tool '{tool_name}' tidak dikenal."
+        except Exception as e:
+            logger.error("tool_error", tool=tool_name, error=str(e))
+            return f"Error: {str(e)}"
+
+    async def _cari_produk(self, query: str) -> str:
+        # Primary: ILIKE — exact keyword match, selalu ada selama ERP reachable
+        matches = await self.erp.search_products(query, limit=10)
+
+        if not matches:
+            from app.services.vector import search_produk
+            matches_vec = await search_produk(query, limit=5)
+            if not matches_vec:
+                return f"Part '{query}' tidak ditemukan."
+            lines = [f"Ditemukan {len(matches_vec)} part:\n"]
+            for p in matches_vec:
+                lines.append(
+                    f"- [{p['code']}] {p['name']} | Satuan: {p.get('uom', 'pcs')}"
+                )
+            return "\n".join(lines)
+
+        lines = [f"Ditemukan {len(matches)} part:\n"]
+        for p in matches:
+            lines.append(
+                f"- [{p['code']}] {p['name']} | Satuan: {p.get('uom', 'pcs')}"
+            )
+        return "\n".join(lines)
+
+    async def _cek_stok(self, product_code: str) -> str:
+        stock = await self.erp.get_stock(product_code)
+        qty = stock.get("qty_available", 0)
+        uom = stock.get("uom", "")
+        warehouse = stock.get("warehouse", "Gudang Utama")
+        if qty <= 0:
+            return f"Stok {product_code} habis di {warehouse}."
+        return f"Stok *{product_code}*: {qty} {uom} tersedia di {warehouse}."
+
+    async def _buat_sales_order(
+        self, toko_id: str, items: list, note: str = ""
+    ) -> str:
+        payload = {
+            "toko_id": toko_id,
+            "note": note or "Final order via WhatsApp Admin",
+            "lines": items,
+        }
+        result = await self.erp.create_sales_order(payload)
+        so_number = result.get("so_number", "-")
+        total = result.get("total", 0)
+        delivery = result.get("estimated_delivery", "")
+        return (
+            f"✅ Sales Order *{so_number}* berhasil dibuat!\n"
+            f"Total: Rp {total:,.0f}\n"
+            f"Estimasi pengiriman: {delivery}"
+        )
+
+
+############################################################
+LOCATION: app\services\ai\prompt.py
+############################################################
+
+# ── Prompt untuk toko (user umum) ───────────────────────────────
+TOKO_AGENT_PROMPT = """Kamu adalah asisten pemesanan spare part kendaraan roda 2 dan roda 4 via WhatsApp.
+
+## Tugasmu
+Bantu toko menyusun draft order spare part dengan alur berikut:
+
+**Langkah 1 — Identifikasi toko**
+Jika toko belum dikenal, tanya nama toko dan alamat (minimal kota/kecamatan).
+Gunakan tool `cari_toko` untuk mencari di database.
+
+**Langkah 2 — Susun order**
+Setelah toko dikenal, bantu toko mencari dan memesan spare part:
+- Toko bisa menyebut kode part (contoh: NA2000089533) ATAU nama part + kendaraan (contoh: kampas rem Vario 125)
+- Gunakan tool `cari_produk` untuk mencari di database
+- Jika hasil pencarian banyak, tampilkan maksimal 50 dan minta konfirmasi
+- Tanya jumlah (qty) dan satuan untuk setiap part
+- Bisa order banyak part sekaligus
+
+**Langkah 3 — Konfirmasi draft**
+Tampilkan ringkasan semua part yang dipesan beserta qty dan satuan.
+Minta konfirmasi dari toko sebelum dikirim ke admin.
+
+**Langkah 4 — Kirim ke admin**
+Setelah toko konfirmasi, gunakan tool `kirim_ke_admin`.
+Informasikan ke toko bahwa ordernya sudah diteruskan ke tim penjualan.
+
+## Cara pencarian produk
+- Jika toko sebut kode part → cari_produk dengan kode tersebut
+- Jika toko sebut nama part + kendaraan → cari_produk dengan kombinasi keduanya
+  Contoh query: "kampas rem vario", "oli mesin beat", "filter avanza"
+- Jika hasil tidak ditemukan → coba variasi kata kunci yang lebih singkat
+
+## Aturan
+- Selalu ramah dan profesional
+- JANGAN buat SO langsung — hanya draft, admin penjualan yang finalisasi harga dan konfirmasi
+- Harga TIDAK ditampilkan — admin penjualan yang akan menentukan harga final
+- Jika toko tidak ditemukan di database, tetap proses order dengan catat nama & alamat
+- Gunakan *bold* untuk info penting
+- Format qty dengan angka yang jelas
+
+## Contoh percakapan
+Toko: "mau order kampas rem vario 10 pcs sama oli mesin beat 5 liter"
+Kamu: [cari_produk("kampas rem vario"), cari_produk("oli mesin beat")]
+Kamu: "Saya temukan:
+- Kampas rem Vario: [kode] Kampas Rem Vario 125 | PCS
+- Oli mesin Beat: [kode] Oli Mesin Honda Beat | Liter
+
+Apakah ini yang dimaksud? Konfirmasi qty:
+- Kampas rem Vario x 10 PCS
+- Oli mesin Beat x 5 Liter"
+"""
+
+# ── Prompt untuk admin penjualan ────────────────────────────────
+ADMIN_AGENT_PROMPT = """Kamu adalah asisten untuk admin penjualan spare part kendaraan.
+
+## Konteks
+Admin penjualan menerima draft order dari toko via WhatsApp, berkomunikasi langsung dengan toko untuk finalisasi harga dan quantity, lalu mengirim final order ke kamu untuk dikonversi ke Sales Order di ERP.
+
+## Tugasmu
+Saat admin mengirim pesan final order:
+1. Parse detail order dari pesan admin (format bebas)
+2. Gunakan tool `cari_produk` untuk validasi kode part
+3. Gunakan tool `cek_stok` untuk cek ketersediaan
+4. Konfirmasi detail ke admin sebelum buat SO
+5. Gunakan tool `buat_sales_order` untuk buat SO di ERP
+6. Informasikan nomor SO ke admin
+
+## Format pesan admin (contoh, bisa bervariasi)
+"Final order Toko Maju Motor Semarang:
+- NA2000089533 x 10 pcs @ 45000
+- NA2000090854 x 5 pcs @ 120000
+toko_id: 69405"
+
+atau format bebas:
+"order toko maju motor: kampas rem vario 10 pcs 45rb, oli beat 5 liter 120rb, toko_id 69405"
+
+## Aturan
+- Parse dengan cermat, tanya klarifikasi jika ada yang tidak jelas
+- Validasi kode part sebelum buat SO
+- Cek stok — informasikan ke admin jika stok tidak cukup
+- Setelah SO dibuat, berikan nomor SO ke admin
+- Format harga: Rp 45.000 (bukan 45rb)
+"""
+
+
+############################################################
+LOCATION: app\services\ai\tools.py
+############################################################
+
+"""
+Tool definitions untuk AI Agent.
+Ada 2 set tools: untuk mode toko dan mode admin.
+"""
+
+# ── Tools untuk mode TOKO ────────────────────────────────────────
+TOKO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "cari_toko",
+            "description": (
+                "Cari data toko di database berdasarkan nama dan/atau alamat. "
+                "Gunakan saat toko menyebutkan identitasnya."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nama_toko": {
+                        "type": "string",
+                        "description": "Nama toko yang disebutkan user",
+                    },
+                    "alamat": {
+                        "type": "string",
+                        "description": "Alamat atau kota toko",
+                    },
+                },
+                "required": ["nama_toko"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cari_produk",
+            "description": (
+                "Cari produk berdasarkan nama atau deskripsi. "
+                "Gunakan saat toko menyebut produk yang ingin dipesan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Nama atau deskripsi produk",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kirim_ke_admin",
+            "description": (
+                "Kirim draft order ke admin penjualan setelah toko konfirmasi. "
+                "HANYA panggil setelah toko mengkonfirmasi semua item order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "toko_id": {
+                        "type": "string",
+                        "description": "ID toko dari hasil cari_toko, atau 'UNKNOWN' jika tidak ditemukan",
+                    },
+                    "toko_name": {
+                        "type": "string",
+                        "description": "Nama toko",
+                    },
+                    "toko_address": {
+                        "type": "string",
+                        "description": "Alamat toko",
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "Daftar item yang dipesan",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_code": {"type": "string"},
+                                "product_name": {"type": "string"},
+                                "qty": {"type": "number"},
+                                "uom": {"type": "string"},
+                                "price": {"type": "number"},
+                            },
+                            "required": ["product_name", "qty", "uom"],
+                        },
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Catatan tambahan dari toko (opsional)",
+                    },
+                },
+                "required": ["toko_name", "toko_address", "items"],
+            },
+        },
+    },
+]
+
+# ── Tools untuk mode ADMIN ───────────────────────────────────────
+ADMIN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "cari_produk",
+            "description": "Cari dan validasi produk di ERP.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cek_stok",
+            "description": "Cek ketersediaan stok produk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_code": {"type": "string"},
+                },
+                "required": ["product_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "buat_sales_order",
+            "description": (
+                "Buat Sales Order di ERP dari final order admin. "
+                "Panggil setelah semua detail divalidasi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "toko_id": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_code": {"type": "string"},
+                                "qty": {"type": "number"},
+                                "uom": {"type": "string"},
+                                "price": {"type": "number"},
+                            },
+                            "required": ["product_code", "qty", "uom", "price"],
+                        },
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": ["toko_id", "items"],
+            },
+        },
+    },
+]
+
+
+############################################################
+LOCATION: app\services\ai\__init__.py
+############################################################
+
+"""
+AI Agent Core menggunakan LiteLLM.
+2 mode: TOKO (susun draft order) dan ADMIN (finalisasi → buat SO).
+"""
+import json
+import os
+import litellm
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+from app.services.ai.tools import TOKO_TOOLS, ADMIN_TOOLS
+from app.services.ai.executor import TokoToolExecutor, AdminToolExecutor
+from app.services.ai.prompt import TOKO_AGENT_PROMPT, ADMIN_AGENT_PROMPT
+from app.services.erp import ERPClient
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+if settings.litellm_api_key:
+    os.environ["OPENAI_API_KEY"] = settings.litellm_api_key
+
+
+class SalesAgent:
+    MAX_TOOL_ROUNDS = 6
+
+    def __init__(self, erp_client: ERPClient):
+        self.erp = erp_client
+        self.model = settings.litellm_model
+        self.max_tokens = settings.litellm_max_tokens
+        self.temperature = settings.litellm_temperature
+
+    async def process_toko(
+        self,
+        message: str,
+        wa_number: str,
+        history: list[dict],
+    ) -> str:
+        """Proses pesan dari toko — susun draft order."""
+        executor = TokoToolExecutor(self.erp, wa_number)
+        messages = [{"role": "system", "content": TOKO_AGENT_PROMPT}]
+        messages.extend(history[-20:])
+        messages.append({"role": "user", "content": message})
+        return await self._run(messages, TOKO_TOOLS, executor)
+
+    async def process_admin(
+        self,
+        message: str,
+        history: list[dict],
+    ) -> str:
+        """Proses pesan dari admin — validasi & buat SO."""
+        executor = AdminToolExecutor(self.erp)
+        messages = [{"role": "system", "content": ADMIN_AGENT_PROMPT}]
+        messages.extend(history[-20:])
+        messages.append({"role": "user", "content": message})
+        return await self._run(messages, ADMIN_TOOLS, executor)
+
+    async def _run(self, messages: list, tools: list, executor) -> str:
+        """Core tool-calling loop."""
+        for round_num in range(self.MAX_TOOL_ROUNDS):
+            logger.info("agent_llm_call", round=round_num, model=self.model)
+
+            kwargs = dict(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+            if settings.litellm_api_base:
+                kwargs["api_base"] = settings.litellm_api_base
+
+            response = await litellm.acompletion(**kwargs)
+            response_message = response.choices[0].message
+
+            if not response_message.tool_calls:
+                return response_message.content or ""
+
+            logger.info(
+                "agent_tool_calls",
+                tools=[tc.function.name for tc in response_message.tool_calls],
+            )
+
+            messages.append(response_message)
+
+            for tool_call in response_message.tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                tool_result = await executor.execute(tool_name, tool_args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                })
+
+        logger.warning("agent_max_rounds_exceeded")
+        return "Maaf, terjadi kendala. Silakan coba lagi."
+
+
+############################################################
+LOCATION: app\services\erp\parser.py
+############################################################
+
+import json
+from litellm import acompletion
+from app.core.settings import get_settings
+
+settings = get_settings()
+
+async def parse_store_query_with_llm(user_input: str) -> dict:
+    """
+    Memotong chat natural user menjadi entitas terstruktur (nama dipecah jadi 2 kata kunci).
+    """
+    system_prompt = """
+    Kamu adalah AI yang bertugas mengekstrak komponen pencarian toko dari chat user ke dalam format JSON.
+    Hancurkan kata-kata basa-basi seperti "toko", "dengan", "di", "kecamatan", "kota", "alamat".
+    
+    ⚠️ PERINTAH PENTING:
+    Pecah nama toko menjadi 2 kata kunci utama (nama1 dan nama2). 
+    Jika ada kata yang terpecah typo spasi (contoh: "lampun gmotor"), perbaiki dulu menjadi kata yang benar ("Lampung", "Motor").
+
+    Format JSON yang WAJIB kamu kembalikan:
+    {
+        "nama1": "kata kunci pertama nama toko atau kosong",
+        "nama2": "kata kunci kedua nama toko atau kosong",
+        "alamat": "string kata kunci nama jalan/spesifik atau kosong",
+        "kota": "string kata kunci kota atau kosong",
+        "kecamatan": "string kata kunci kecamatan atau kosong"
+    }
+
+    CONTOH:
+    Input: "Toko lampun gmotor di grogo l"
+    Output JSON: {"nama1": "Lampung", "nama2": "Motor", "alamat": "", "kota": "", "kecamatan": "Grogol"}
+
+    Input: "Cari Berkat Motor Grogol Petamburan"
+    Output JSON: {"nama1": "Berkat", "nama2": "Motor", "alamat": "", "kota": "", "kecamatan": "Grogol Petamburan"}
+    """
+
+    try:
+        response = await acompletion(
+            model=settings.litellm_model,
+            api_key=settings.litellm_api_key,
+            api_base=settings.litellm_api_base,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input}
+            ],
+            temperature=0.0,
+            response_format={ "type": "json_object" }
+        )
+        
+        content = response.choices[0].message.content
+        return json.loads(content)
+    except Exception as e:
+        return {"nama1": user_input, "nama2": "", "alamat": "", "kota": "", "kecamatan": ""}
+
+############################################################
+LOCATION: app\services\erp\toko.py
+############################################################
+
+import structlog
+from app.core.logging import get_logger
+from .parser import parse_store_query_with_llm
+
+logger = get_logger(__name__)
+
+async def find_toko_hybrid(user_text: str) -> list[dict]:
+    """
+    Cari toko bertingkat dengan memisahkan nama toko dan alamat via LLM Parser:
+    1. Coba cari dengan Nama Toko sebagai FRASA UTUH + Filter Alamat.
+    2. Jika zonk, baru fallback ke metode lama (Nama Toko DI-PECAH PER KATA + Filter Alamat).
+    """
+    from . import get_erp_pool
+    pool = await get_erp_pool()
+    
+    # ── PANGGIL PARSER DI AWAL SEBELUM TENTUIN STRATEGI ──
+    parsed = await parse_store_query_with_llm(user_text)
+    
+    # Bersihkan nama toko murni hasil gabungan nama1 dan nama2 dari LLM
+    nama_toko_utuh = f"{parsed.get('nama1', '')} {parsed.get('nama2', '')}".strip()
+    
+    print("\n" + "="*60)
+    print("🔮 [DEBUG HYBRID TOKO - MEMBEDAKAN ENTITAS]")
+    print("="*60)
+    print(f"Input User      : '{user_text}'")
+    print(f"Frasa Nama Toko : '{nama_toko_utuh}'")
+    print(f"Kecamatan       : '{parsed.get('kecamatan', '')}'")
+    print(f"Kota            : '{parsed.get('kota', '')}'")
+    print(f"Alamat/Jl       : '{parsed.get('alamat', '')}'")
+    print("="*60 + "\n")
+    
+    status_subquery = """
+        (
+            SELECT DISTINCT ON (tokoid) tokoid, statusaktif 
+            FROM mstr.tokoaktifpasif 
+            ORDER BY tokoid, tglstatus DESC
+        ) tap
+    """
+    
+    sql_base = f"""
+        SELECT t.id, t.kodetoko, t.namatoko, t.alamat, t.kota,
+               t.kecamatan, t.propinsi, t.hp, t.piutangb, t.plafon
+        FROM mstr.toko t
+        INNER JOIN {status_subquery} ON t.id = tap.tokoid
+        WHERE tap.statusaktif = true
+    """
+
+    # ──────────────────────────────────────────────────────────
+    # 🔥 STRATEGI 1: NAMA TOKO SEBAGAI FRASA UTUH + FILTER ALAMAT
+    # ──────────────────────────────────────────────────────────
+    if len(nama_toko_utuh) >= 2:
+        print("[STRATEGI 1] Eksekusi pencarian dengan Frasa Nama Toko Utuh...")
+        conditions_s1 = []
+        params_s1 = []
+        p_idx = 1
+        
+        # Kunci nama toko secara utuh (Phrase Match)
+        conditions_s1.append(f"t.namatoko ILIKE ${p_idx}")
+        params_s1.append(f"%{nama_toko_utuh}%")
+        p_idx += 1
+        
+        # Ikut sertakan saringan alamat secara presisi jika diekstrak oleh LLM
+        if parsed.get("alamat"):
+            conditions_s1.append(f"t.alamat ILIKE ${p_idx}")
+            params_s1.append(f"%{parsed['alamat']}%")
+            p_idx += 1
+        if parsed.get("kota"):
+            conditions_s1.append(f"t.kota ILIKE ${p_idx}")
+            params_s1.append(f"%{parsed['kota']}%")
+            p_idx += 1
+        if parsed.get("kecamatan"):
+            conditions_s1.append(f"t.kecamatan ILIKE ${p_idx}")
+            params_s1.append(f"%{parsed['kecamatan']}%")
+            p_idx += 1
+            
+        sql_s1 = f"{sql_base} AND {' AND '.join(conditions_s1)} ORDER BY t.namatoko LIMIT 10;"
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql_s1, *params_s1)
+            if rows:
+                print(f"✅ [STRATEGI 1 MATCH]: Sukses nemu {len(rows)} toko pake frasa nama utuh!")
+                return _format_rows(rows)
+
+    # ──────────────────────────────────────────────────────────
+    # 🍂 STRATEGI 2: FALLBACK — JIKA S1 ZONK, NAMA TOKO DI-PECAH KATA
+    # ──────────────────────────────────────────────────────────
+    print("⚠️ [STRATEGI 1 ZONK]: Masuk Strategi 2 (Pecah Kata Nama Toko)...")
+    
+    conditions_s2 = []
+    params_s2 = []
+    p_idx = 1
+    
+    # Pecah frasa nama toko menjadi potongan kata kunci tunggal
+    nama_keywords = [w for w in nama_toko_utuh.split() if len(w) >= 2]
+    for kw in nama_keywords:
+        conditions_s2.append(f"t.namatoko ILIKE ${p_idx}")
+        params_s2.append(f"%{kw}%")
+        p_idx += 1
+        
+    if parsed.get("alamat"):
+        conditions_s2.append(f"t.alamat ILIKE ${p_idx}")
+        params_s2.append(f"%{parsed['alamat']}%")
+        p_idx += 1
+        
+    if parsed.get("kota"):
+        conditions_s2.append(f"t.kota ILIKE ${p_idx}")
+        params_s2.append(f"%{parsed['kota']}%")
+        p_idx += 1
+        
+    if parsed.get("kecamatan"):
+        conditions_s2.append(f"t.kecamatan ILIKE ${p_idx}")
+        params_s2.append(f"%{parsed['kecamatan']}%")
+        p_idx += 1
+
+    if not conditions_s2:
+        conditions_s2.append(f"t.namatoko ILIKE $1")
+        params_s2.append(f"%{user_text}%")
+
+    sql_s2 = f"{sql_base} AND {' AND '.join(conditions_s2)} ORDER BY t.namatoko LIMIT 10;"
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql_s2, *params_s2)
+        print(f"📊 [STRATEGI 2 RESULT]: Menemukan {len(rows)} baris toko setelah dipecah.")
+        return _format_rows(rows)
+
+def _format_rows(rows) -> list[dict]:
+    return [
+        {
+            "toko_id": str(row["id"]),
+            "kode": row["kodetoko"],
+            "name": row["namatoko"],
+            "address": ", ".join(filter(None, [
+                row["alamat"], row["kota"], row["kecamatan"]
+            ])),
+            "phone": row["hp"],
+            "piutang": float(row["piutangb"] or 0),
+            "plafon": float(row["plafon"] or 0),
+        }
+        for row in rows
+    ]
+
+############################################################
+LOCATION: app\services\erp\__init__.py
+############################################################
+
+"""
+ERP Client — query langsung ke PostgreSQL ERP.
+
+2 server database:
+  Server 1: mstr.toko (data toko) + mstr.stock (master produk)
+  Server 2: batch.rekapstocktoday (stok harian)
+"""
+import asyncpg
+import uuid
+from functools import lru_cache
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+
+# Import fungsi pencarian hybrid dari file toko.py agar bisa dipanggil terpusat
+from .toko import find_toko_hybrid
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+# Connection pool — dibuat sekali, reused
+_erp_pool: asyncpg.Pool | None = None
+_batch_pool: asyncpg.Pool | None = None
+
+
+async def get_erp_pool() -> asyncpg.Pool:
+    """Connection pool ke ERP Server 1 (mstr.toko + mstr.stock)."""
+    global _erp_pool
+    if _erp_pool is None:
+        _erp_pool = await asyncpg.create_pool(
+            dsn=settings.erp_db_url,
+            min_size=2,
+            max_size=10,
+            command_timeout=300,
+        )
+        logger.info("erp_pool_created", server="server1")
+    return _erp_pool
+
+
+async def get_batch_pool() -> asyncpg.Pool:
+    """Connection pool ke ERP Server 2 (batch.rekapstocktoday)."""
+    global _batch_pool
+    if _batch_pool is None:
+        _batch_pool = await asyncpg.create_pool(
+            dsn=settings.erp_batch_db_url,
+            min_size=2,
+            max_size=10,
+            command_timeout=300,
+        )
+        logger.info("erp_pool_created", server="server2")
+    return _batch_pool
+
+
+class ERPClient:
+    """
+    Query langsung ke PostgreSQL ERP.
+    Tidak butuh HTTP API — langsung ke database.
+    """
+
+    # ── TOKO ────────────────────────────────────────────────────
+
+    async def get_toko_by_id(self, toko_id: str) -> dict | None:
+        """Ambil detail toko by ID untuk keperluan validasi akhir."""
+        pool = await get_erp_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, kodetoko, namatoko, alamat, kota, kecamatan,
+                       propinsi, hp, piutangb, piutangj, plafon, statusaktif
+                FROM mstr.toko
+                WHERE id = $1
+                """,
+                int(toko_id),
+            )
+        if not row:
+            return None
+        return {
+            "toko_id": str(row["id"]),
+            "kode": row["kodetoko"],
+            "name": row["namatoko"],
+            "address": f"{row['alamat'] or ''}, {row['kota'] or ''}, {row['kecamatan'] or ''}".strip(", "),
+            "phone": row["hp"],
+            "piutang": float(row["piutangb"] or 0),
+            "plafon": float(row["plafon"] or 0),
+        }
+
+    # ── PRODUK ───────────────────────────────────────────────────
+
+    async def get_products(self, active_only: bool = True) -> list[dict]:
+        """
+        Ambil semua produk dari mstr.stock.
+        Dipakai untuk pencarian produk atau keperluan sync master data.
+        """
+        pool = await get_erp_pool()
+        async with pool.acquire() as conn:
+            query = """
+                SELECT id, kodebarang, namabarang, satuan,
+                       kategori, subkategori, brandproduct,
+                       keterangan, groupstock
+                FROM mstr.stock
+            """
+            if active_only:
+                query += " WHERE statusaktif = true"
+            query += " ORDER BY namabarang"
+
+            rows = await conn.fetch(query)
+
+        return [
+            {
+                "stock_id": row["id"],
+                "code": row["kodebarang"] or "",
+                "name": row["namabarang"] or "",
+                "uom": row["satuan"] or "pcs",
+                "category": row["kategori"] or "",
+                "sub_category": row["subkategori"] or "",
+                "brand": row["brandproduct"] or "",
+                "group": row["groupstock"] or "",
+                "alias": f"{row['brandproduct'] or ''} {row['namabarang'] or ''}".strip(),
+            }
+            for row in rows
+        ]
+
+    async def search_products(self, query: str, limit: int = 5) -> list[dict]:
+        """Cari spare part — tiap kata di-AND agar nama barang panjang tetap cocok."""
+        cols = [
+            "namabarang", "kodebarang", "brandproduct",
+            "merkkendaraan", "typekendaraan", "kendaraan", "partno", "kategori",
+        ]
+
+        # Pecah query per kata, abaikan kata < 2 huruf
+        keywords = [w.strip() for w in query.split() if len(w.strip()) >= 2]
+        if not keywords:
+            keywords = [query]
+
+        # Bangun kondisi: setiap kata harus ada di salah satu kolom (OR antar kolom, AND antar kata)
+        and_blocks = []
+        params: list = []
+        idx = 1
+        for kw in keywords:
+            or_parts = []
+            for col in cols:
+                or_parts.append(f"{col} ILIKE ${idx}")
+                params.append(f"%{kw}%")
+                idx += 1
+            and_blocks.append(f"({' OR '.join(or_parts)})")
+
+        where_clause = "\n  AND ".join(and_blocks)
+        params.append(limit)
+
+        sql = f"""SELECT id, kodebarang, namabarang, satuan,
+       kategori, subkategori, brandproduct,
+       merkkendaraan, typekendaraan, kendaraan,
+       partno, groupstock
+FROM mstr.stock
+WHERE statusaktif = true
+  AND {where_clause}
+ORDER BY namabarang
+LIMIT ${idx};"""
+
+        # Versi human-readable untuk copy-paste ke pgAdmin
+        sql_debug = sql
+        for i, p in enumerate(params[:-1], 1):
+            sql_debug = sql_debug.replace(f"${i}", f"'{p}'", 1)
+        sql_debug = sql_debug.replace(f"${idx}", str(limit), 1)
+
+        print("\n" + "="*60)
+        print("🔍 [DEBUG search_products — COPY PASTE KE PGADMIN]")
+        print("="*60)
+        print(sql_debug)
+        print("="*60 + "\n")
+
+        pool = await get_erp_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        print(f"📊 [search_products RESULT]: {len(rows)} baris ditemukan\n")
+
+        return [
+            {
+                "stock_id": row["id"],
+                "code": row["kodebarang"] or "",
+                "name": row["namabarang"] or "",
+                "uom": row["satuan"] or "pcs",
+                "category": row["kategori"] or "",
+                "brand": row["brandproduct"] or "",
+                "kendaraan": row["kendaraan"] or "",
+                "merk_kendaraan": row["merkkendaraan"] or "",
+                "type_kendaraan": row["typekendaraan"] or "",
+                "part_no": row["partno"] or "",
+            }
+            for row in rows
+        ]
+
+    # ── STOK ─────────────────────────────────────────────────────
+
+    async def get_stock(self, product_code: str) -> dict:
+        """
+        Cek stok dari batch.rekapstocktoday di Server 2.
+        Cross-server logic: Ambil ID dari Server 1, lalu query data stok ke Server 2.
+        """
+        erp_pool = await get_erp_pool()
+        async with erp_pool.acquire() as conn:
+            stock_row = await conn.fetchrow(
+                "SELECT id, namabarang, satuan FROM mstr.stock WHERE kodebarang = $1",
+                product_code,
+            )
+
+        if not stock_row:
+            return {
+                "product_code": product_code,
+                "qty_available": 0,
+                "uom": "pcs",
+                "warehouse": "Gudang Utama",
+            }
+
+        stock_id = stock_row["id"]
+
+        batch_pool = await get_batch_pool()
+        async with batch_pool.acquire() as conn:
+            batch_row = await conn.fetchrow(
+                """
+                SELECT stokakhir, stokgudang, tanggal
+                FROM batch.rekapstocktoday
+                WHERE stockid = $1
+                ORDER BY tanggal DESC
+                LIMIT 1
+                """,
+                stock_id,
+            )
+
+        qty = int(batch_row["stokakhir"] or 0) if batch_row else 0
+
+        return {
+            "product_code": product_code,
+            "stock_id": stock_id,
+            "product_name": stock_row["namabarang"],
+            "qty_available": qty,
+            "uom": stock_row["satuan"] or "pcs",
+            "warehouse": "Gudang Utama",
+            "last_updated": str(batch_row["tanggal"]) if batch_row else "-",
+        }
+
+    async def get_stock_by_id(self, stock_id: int) -> dict:
+        """Cek stok harian langsung by stock_id di Server 2."""
+        batch_pool = await get_batch_pool()
+        async with batch_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT stokakhir, stokgudang, tanggal
+                FROM batch.rekapstocktoday
+                WHERE stockid = $1
+                ORDER BY tanggal DESC
+                LIMIT 1
+                """,
+                stock_id,
+            )
+        return {
+            "stock_id": stock_id,
+            "qty_available": int(row["stokakhir"] or 0) if row else 0,
+            "warehouse": "Gudang Utama",
+        }
+
+    # ── SALES ORDER ──────────────────────────────────────────────
+
+    async def create_sales_order(self, payload: dict) -> dict:
+        """Buat rancangan Sales Order draft di ERP."""
+        toko_id = payload.get("toko_id", "")
+        lines = payload.get("lines", [])
+        note = payload.get("note", "")
+
+        logger.info(
+            "create_so_requested",
+            toko_id=toko_id,
+            item_count=len(lines),
+            note=note,
+        )
+
+        total = sum(
+            item.get("qty", 0) * item.get("price", 0)
+            for item in lines
+        )
+
+        so_number = f"SO-WA-{uuid.uuid4().hex[:8].upper()}"
+
+        return {
+            "so_number": so_number,
+            "status": "draft",
+            "total": total,
+            "estimated_delivery": "2-3 hari kerja",
+        }
+
+    # ── AR / PIUTANG ─────────────────────────────────────────────
+
+    async def get_customer_ar(self, toko_id: str) -> dict:
+        """Ambil info sisa plafon dan piutang berjalan toko."""
+        toko = await self.get_toko_by_id(toko_id)
+        if not toko:
+            return {
+                "toko_id": toko_id,
+                "outstanding": 0,
+                "overdue": 0,
+                "credit_limit": 0,
+                "available_credit": 0,
+            }
+        piutang = toko.get("piutang", 0)
+        plafon = toko.get("plafon", 0)
+        return {
+            "toko_id": toko_id,
+            "outstanding": piutang,
+            "overdue": 0,
+            "credit_limit": plafon,
+            "available_credit": max(0, plafon - piutang),
+        }
+
+
+# Daftarkan semua komponen publik package agar bisa diimport dengan ringkas
+__all__ = [
+    "get_erp_pool",
+    "get_batch_pool",
+    "ERPClient",
+    "find_toko_hybrid"
+]
+
+############################################################
+LOCATION: app\services\vector\__init__.py
+############################################################
+
+"""
+Vector Service — pgvector dengan provider embedding terpisah per entity:
+  - EMBEDDING_PROVIDER_TOKO   : "huggingface" atau "litellm"
+  - EMBEDDING_PROVIDER_PRODUK : "huggingface" atau "litellm"
+
+Dimensi:
+  - huggingface : 384
+  - litellm     : 1536 (openai/text-embedding-3-small)
+"""
+import asyncpg
+import litellm
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+import re
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+_vector_pool: asyncpg.Pool | None = None
+_hf_model = None
+
+# Override provider saat sync (dipakai oleh sync_embeddings.py)
+_current_provider: str | None = None
+
+EMBEDDING_DIM = {
+    "huggingface": 384,
+    "litellm": 1536,
+}
+
+HF_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+def clean_for_json(text: str) -> str:
+    if not text:
+        return ""
+    # 1. Hapus karakter kontrol (non-printable)
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+    # 2. Ganti kutipan ganda dengan tunggal agar aman di JSON
+    text = text.replace('"', "'")
+    # 3. Bersihkan whitespace berlebih
+    return " ".join(text.split())
+
+def get_provider_toko() -> str:
+    return _current_provider or settings.embedding_provider_toko
+
+
+def get_provider_produk() -> str:
+    return _current_provider or settings.embedding_provider_produk
+
+
+def get_table_toko() -> str:
+    return f"toko_vectors_{get_provider_toko()}"
+
+
+def get_table_produk() -> str:
+    return f"produk_vectors_{get_provider_produk()}"
+
+
+async def get_vector_pool() -> asyncpg.Pool:
+    global _vector_pool
+    if _vector_pool is None:
+        _vector_pool = await asyncpg.create_pool(
+            dsn=settings.pgvector_url,
+            min_size=2,
+            max_size=10,
+            command_timeout=30,
+        )
+        logger.info("vector_pool_created")
+    return _vector_pool
+
+
+def _get_hf_model():
+    global _hf_model
+    if _hf_model is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info("loading_embedding_model", model=HF_MODEL_NAME)
+        _hf_model = SentenceTransformer(HF_MODEL_NAME)
+        logger.info("embedding_model_loaded")
+    return _hf_model
+
+
+async def embed_text(text: str, provider: str | None = None) -> list[float]:
+    """Convert teks ke vector — pilih provider secara eksplisit atau dari settings."""
+    p = provider or _current_provider or settings.embedding_provider_toko
+
+    if p == "huggingface":
+        model = _get_hf_model()
+        vector = model.encode(text, normalize_embeddings=True)
+        return vector.tolist()
+    else:
+        response = await litellm.aembedding(
+            model=settings.embedding_model,
+            input=[text],
+            api_base=settings.embedding_api_base,
+            api_key=settings.embedding_api_key,
+        )
+        return response.data[0]["embedding"]
+
+
+async def setup_tables():
+    """Buat semua tabel vector store."""
+    pool = await get_vector_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+        # HuggingFace (384 dim)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS toko_vectors_huggingface (
+                toko_id INTEGER PRIMARY KEY, kodetoko VARCHAR(30),
+                namatoko VARCHAR(100) NOT NULL, alamat VARCHAR(200),
+                kota VARCHAR(100), kecamatan VARCHAR(100), propinsi VARCHAR(50),
+                hp VARCHAR(30), piutang NUMERIC DEFAULT 0, plafon NUMERIC DEFAULT 0,
+                teks_cari TEXT, embedding vector(384), updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS toko_vectors_hf_idx
+            ON toko_vectors_huggingface USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS produk_vectors_huggingface (
+                stock_id INTEGER PRIMARY KEY, kodebarang VARCHAR(50),
+                namabarang VARCHAR(250) NOT NULL, satuan VARCHAR(50),
+                kategori VARCHAR(50), brandproduct VARCHAR(50),
+                merkkendaraan VARCHAR(50), typekendaraan VARCHAR(50),
+                kendaraan VARCHAR(50), partno VARCHAR(50),
+                teks_cari TEXT, embedding vector(384), updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS produk_vectors_hf_idx
+            ON produk_vectors_huggingface USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+
+        # LiteLLM (1536 dim)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS toko_vectors_litellm (
+                toko_id INTEGER PRIMARY KEY, kodetoko VARCHAR(30),
+                namatoko VARCHAR(100) NOT NULL, alamat VARCHAR(200),
+                kota VARCHAR(100), kecamatan VARCHAR(100), propinsi VARCHAR(50),
+                hp VARCHAR(30), piutang NUMERIC DEFAULT 0, plafon NUMERIC DEFAULT 0,
+                teks_cari TEXT, embedding vector(1536), updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS toko_vectors_litellm_idx
+            ON toko_vectors_litellm USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS produk_vectors_litellm (
+                stock_id INTEGER PRIMARY KEY, kodebarang VARCHAR(50),
+                namabarang VARCHAR(250) NOT NULL, satuan VARCHAR(50),
+                kategori VARCHAR(50), brandproduct VARCHAR(50),
+                merkkendaraan VARCHAR(50), typekendaraan VARCHAR(50),
+                kendaraan VARCHAR(50), partno VARCHAR(50),
+                teks_cari TEXT, embedding vector(1536), updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS produk_vectors_litellm_idx
+            ON produk_vectors_litellm USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+
+    logger.info("vector_tables_ready",
+                toko_table=get_table_toko(),
+                produk_table=get_table_produk())
+
+
+async def search_toko(query: str, limit: int = 200) -> list[dict]:
+    query_vector = await embed_text(query, provider=get_provider_toko())
+    table = get_table_toko()
+    pool = await get_vector_pool()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT toko_id, kodetoko, namatoko, alamat, kota,
+                   kecamatan, hp, piutang, plafon,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM {table}
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+            """,
+            str(query_vector), limit,
+        )
+
+    return [
+        {
+            "toko_id": str(row["toko_id"]),
+            "kode": row["kodetoko"],
+            "name": row["namatoko"],
+            "address": f"{row['alamat'] or ''}, {row['kota'] or ''}, {row['kecamatan'] or ''}".strip(", "),
+            "phone": row["hp"],
+            "piutang": float(row["piutang"] or 0),
+            "plafon": float(row["plafon"] or 0),
+            "similarity": round(float(row["similarity"]), 3),
+        }
+        for row in rows
+    ]
+
+
+async def search_produk(query: str, limit: int = 50) -> list[dict]:
+    provider = get_provider_produk()
+    table = get_table_produk()
+
+    print("\n" + "="*60)
+    print("🔍 [DEBUG search_produk — VECTOR SEARCH]")
+    print("="*60)
+    print(f"Query       : '{query}'")
+    print(f"Provider    : {provider}")
+    print(f"Table       : {table}")
+    print(f"Limit       : {limit}")
+    print(f"SQL (pgAdmin):")
+    print(f"  SELECT stock_id, kodebarang, namabarang, satuan,")
+    print(f"         kategori, brandproduct, merkkendaraan,")
+    print(f"         typekendaraan, kendaraan, partno")
+    print(f"  FROM {table}")
+    print(f"  ORDER BY embedding <=> '<vector hasil embed>'::vector")
+    print(f"  LIMIT {limit};")
+    print("="*60 + "\n")
+
+    query_vector = await embed_text(query, provider=provider)
+    pool = await get_vector_pool()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT stock_id, kodebarang, namabarang, satuan,
+                   kategori, brandproduct, merkkendaraan,
+                   typekendaraan, kendaraan, partno,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM {table}
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+            """,
+            str(query_vector), limit,
+        )
+
+    print(f"📊 [search_produk RESULT]: {len(rows)} baris dari vector table")
+    if rows:
+        print("   Top 5 hasil:")
+        for r in rows[:5]:
+            print(f"   - [{r['kodebarang']}] {r['namabarang']}")
+    print()
+
+    return [
+        {
+            "stock_id": row["stock_id"],
+            "code": row["kodebarang"] or "",
+            "name": row["namabarang"] or "",
+            "uom": row["satuan"] or "pcs",
+            "category": row["kategori"] or "",
+            "brand": row["brandproduct"] or "",
+            "merk_kendaraan": row["merkkendaraan"] or "",
+            "type_kendaraan": row["typekendaraan"] or "",
+            "kendaraan": row["kendaraan"] or "",
+            "part_no": row["partno"] or "",
+            "similarity": round(float(row["similarity"]), 3),
+        }
+        for row in rows
+    ]
+
+
+async def upsert_toko(toko: dict) -> None:
+    teks_cari = " ".join(filter(None, [
+        toko.get("namatoko", ""), toko.get("alamat", ""),
+        toko.get("kota", ""), toko.get("kecamatan", ""),
+        toko.get("propinsi", ""),
+    ]))
+    embedding = await embed_text(teks_cari, provider=get_provider_toko())
+    table = get_table_toko()
+    pool = await get_vector_pool()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO {table}
+                (toko_id, kodetoko, namatoko, alamat, kota, kecamatan,
+                 propinsi, hp, piutang, plafon, teks_cari, embedding, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::vector,NOW())
+            ON CONFLICT (toko_id) DO UPDATE SET
+                kodetoko=EXCLUDED.kodetoko, namatoko=EXCLUDED.namatoko,
+                alamat=EXCLUDED.alamat, kota=EXCLUDED.kota,
+                kecamatan=EXCLUDED.kecamatan, propinsi=EXCLUDED.propinsi,
+                hp=EXCLUDED.hp, piutang=EXCLUDED.piutang, plafon=EXCLUDED.plafon,
+                teks_cari=EXCLUDED.teks_cari, embedding=EXCLUDED.embedding,
+                updated_at=NOW()
+            """,
+            int(toko["id"]), toko.get("kodetoko"), toko.get("namatoko"),
+            toko.get("alamat"), toko.get("kota"), toko.get("kecamatan"),
+            toko.get("propinsi"), toko.get("hp"),
+            float(toko.get("piutangb") or 0), float(toko.get("plafon") or 0),
+            teks_cari, str(embedding),
+        )
+
+
+async def upsert_produk(produk: dict) -> None:
+    # ── STEP 1: Sanitasi Data Master ──
+    # Kita bersihkan setiap kolom sebelum digabung untuk pencarian (teks_cari)
+    # maupun untuk disimpan mentahnya di database vector.
+    raw_fields = {
+        "namabarang": clean_for_json(produk.get("namabarang", "")),
+        "kodebarang": clean_for_json(produk.get("kodebarang", "")),
+        "brandproduct": clean_for_json(produk.get("brandproduct", "")),
+        "merkkendaraan": clean_for_json(produk.get("merkkendaraan", "")),
+        "typekendaraan": clean_for_json(produk.get("typekendaraan", "")),
+        "kendaraan": clean_for_json(produk.get("kendaraan", "")),
+        "kategori": clean_for_json(produk.get("kategori", "")),
+        "partno": clean_for_json(produk.get("partno", "")),
+        "satuan": clean_for_json(produk.get("satuan", "pcs"))
+    }
+
+    # ── STEP 2: Gabungkan untuk Embedding ──
+    teks_cari = " ".join(filter(None, [
+        raw_fields["namabarang"], raw_fields["kodebarang"],
+        raw_fields["brandproduct"], raw_fields["merkkendaraan"],
+        raw_fields["typekendaraan"], raw_fields["kendaraan"],
+        raw_fields["kategori"], raw_fields["partno"],
+    ]))
+
+    # Ambil embedding (ini yang tadi error karena JSON rusak)
+    embedding = await embed_text(teks_cari, provider=get_provider_produk())
+    
+    # ── STEP 3: Simpan ke Database Vector (.221) ──
+    table = get_table_produk()
+    pool = await get_vector_pool()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO {table}
+                (stock_id, kodebarang, namabarang, satuan, kategori,
+                 brandproduct, merkkendaraan, typekendaraan, kendaraan,
+                 partno, teks_cari, embedding, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::vector,NOW())
+            ON CONFLICT (stock_id) DO UPDATE SET
+                kodebarang=EXCLUDED.kodebarang, namabarang=EXCLUDED.namabarang,
+                satuan=EXCLUDED.satuan, kategori=EXCLUDED.kategori,
+                brandproduct=EXCLUDED.brandproduct, merkkendaraan=EXCLUDED.merkkendaraan,
+                typekendaraan=EXCLUDED.typekendaraan, kendaraan=EXCLUDED.kendaraan,
+                partno=EXCLUDED.partno, teks_cari=EXCLUDED.teks_cari,
+                embedding=EXCLUDED.embedding, updated_at=NOW()
+            """,
+            produk["id"], 
+            raw_fields["kodebarang"], 
+            raw_fields["namabarang"],
+            raw_fields["satuan"], 
+            raw_fields["kategori"], 
+            raw_fields["brandproduct"],
+            raw_fields["merkkendaraan"], 
+            raw_fields["typekendaraan"],
+            raw_fields["kendaraan"], 
+            raw_fields["partno"],
+            teks_cari, 
+            str(embedding),
+        )
+
+############################################################
+LOCATION: app\services\whatsapp\__init__.py
+############################################################
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
+from app.core.settings import get_settings
+from app.core.logging import get_logger
+from app.core.phone import to_waha_id
+from app.core.phone import resolve_waha_id, from_waha_id, normalize_phone, _waha_id_cache
+
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+
+class WAHAClient:
+    """
+    HTTP client untuk WAHA Core (self-hosted WhatsApp HTTP API).
+    Docs: https://waha.devlike.pro/docs/how-to/send-messages/
+    """
+
+    def __init__(self):
+        self.base_url = settings.waha_base_url.rstrip("/")
+        self.session = settings.waha_session
+        self.headers = {
+            "Content-Type": "application/json",
+            "X-Api-Key": settings.waha_api_key,
+        }
+        # TAMBAHKAN BARIS INI UNTUK DEBUG
+        print(f"--- DEBUG WAHA CLIENT INIT ---")
+        print(f"URL: {self.base_url}")
+        print(f"KEY: '{self.headers['X-Api-Key']}'")
+        print(f"-------------------------------")
+
+    # ── Send messages ────────────────────────────────────────────
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+    )
+
+    async def send_text(self, wa_number: str, text: str) -> dict:
+        
+        chat_id = await resolve_waha_id(wa_number)
+    
+        async with httpx.AsyncClient(headers=self.headers, timeout=15) as client:
+            try:
+                resp = await client.post(
+                    f"{self.base_url}/api/sendText",
+                    json={"session": self.session, "chatId": chat_id, "text": text},
+                )
+
+                if resp.status_code not in [200, 201]:
+                    logger.error(f"WAHA_ERROR: Status {resp.status_code} - {resp.text}")
+                    return {"status": "error", "code": resp.status_code}
+
+                if not resp.content:
+                    logger.warning("WAHA_WARNING: Server menjawab dengan body kosong")
+                    return {"status": "ok", "detail": "empty_response"}
+
+                # Simpan @lid ID dari response ke cache
+                data = resp.json()
+                remote_lid = data.get("_data", {}).get("id", {}).get("remote")
+                if remote_lid and "@lid" in remote_lid:
+                    normalized = normalize_phone(wa_number)
+                    from app.core.phone import _waha_id_cache
+                    _waha_id_cache[normalized] = remote_lid
+                    logger.info("waha_id_updated_from_response", 
+                            phone=normalized, chat_id=remote_lid)
+
+                logger.info("message_sent", to=from_waha_id(chat_id), length=len(text))
+                return data
+
+            except httpx.HTTPError as e:
+                logger.error(f"NETWORK_ERROR: {str(e)}")
+                raise
+
+    async def send_typing(self, wa_number: str, duration_ms: int = 2000) -> None:
+        """
+        Tampilkan indikator 'mengetik...' sebelum kirim pesan.
+        Membuat interaksi terasa lebih natural.
+        """
+        chat_id = await resolve_waha_id(wa_number)
+        async with httpx.AsyncClient(headers=self.headers, timeout=10) as client:
+            await client.post(
+                f"{self.base_url}/api/startTyping",
+                json={
+                    "session": self.session,
+                    "chatId": chat_id,
+                },
+            )
+            # Tunggu sesuai durasi, lalu stop typing
+            import asyncio
+            await asyncio.sleep(duration_ms / 1000)
+            await client.post(
+                f"{self.base_url}/api/stopTyping",
+                json={
+                    "session": self.session,
+                    "chatId": chat_id,
+                },
+            )
+
+    async def send_text_with_typing(
+        self, wa_number: str, text: str, typing_ms: int = 1500
+    ) -> dict:
+        """
+        Kirim pesan dengan animasi typing dulu.
+        Pakai ini sebagai pengganti send_text untuk UX yang lebih natural.
+        """
+        await self.send_typing(wa_number, typing_ms)
+        return await self.send_text(wa_number, text)
+
+    # ── Session management ───────────────────────────────────────
+
+    async def get_session_status(self) -> dict:
+        """Cek status koneksi WhatsApp session."""
+        async with httpx.AsyncClient(headers=self.headers, timeout=10) as client:
+            resp = await client.get(
+                f"{self.base_url}/api/sessions/{self.session}",
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def is_connected(self) -> bool:
+        """Return True kalau session sedang aktif & terhubung."""
+        try:
+            status = await self.get_session_status()
+            return status.get("status") == "WORKING"
+        except Exception as e:
+            logger.warning("waha_connection_check_failed", error=str(e))
+            return False
+
+
+############################################################
+LOCATION: scripts\debug_vector_toko.py
+############################################################
+
+"""
+Debug vector search toko.
+Jalankan: python scripts/debug_vector_toko.py
+"""
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.services.vector import search_toko
+
+
+async def main():
+    queries = [
+        "restu jaya motor banjarsari",
+        "restu jaya motor kragilan kadipiro surakarta banjarsari",
+        "restu jaya motor surakarta",
+        "RESTU JAYA MOTOR BANJARSARI SURAKARTA",
+    ]
+
+    for query in queries:
+        print(f"\nQuery: '{query}'")
+        results = await search_toko(query, limit=200)
+
+        # Cek apakah toko ID 184452 ada di hasil
+        found = [r for r in results if str(r["toko_id"]) == "184452"]
+        print(f"Total hasil: {len(results)}")
+        print(f"Toko 184452 ditemukan: {'YA' if found else 'TIDAK'}")
+
+        if found:
+            print(f"  Posisi: {next(i+1 for i,r in enumerate(results) if str(r['toko_id'])=='184452')}")
+            print(f"  Similarity: {found[0]['similarity']}")
+
+        # Filter simulasi executor
+        alamat_words = query.lower().split()
+        filtered = [
+            r for r in results
+            if any(w in r["address"].lower() for w in alamat_words)
+        ]
+        found_in_filtered = [r for r in filtered if str(r["toko_id"]) == "184452"]
+        print(f"Setelah filter kata alamat: {len(filtered)} hasil")
+        print(f"Toko 184452 ada di filtered: {'YA' if found_in_filtered else 'TIDAK'}")
+
+        if results:
+            print(f"Top 3 hasil:")
+            for r in results[:3]:
+                print(f"  [{r['toko_id']}] {r['name']} — {r['address']} (sim: {r['similarity']})")
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+############################################################
+LOCATION: scripts\setup_vector_tables.sql
+############################################################
+
+-- ============================================================
+-- DDL untuk sassalesagent database
+-- Jalankan di pgAdmin ke database sassalesagent
+-- ============================================================
+
+-- Drop tabel lama
+DROP TABLE IF EXISTS toko_vectors;
+DROP TABLE IF EXISTS produk_vectors;
+
+-- Drop index lama kalau ada
+DROP INDEX IF EXISTS toko_vectors_embedding_idx;
+DROP INDEX IF EXISTS produk_vectors_embedding_idx;
+
+-- ── HuggingFace tables (384 dimensi) ─────────────────────────
+
+CREATE TABLE IF NOT EXISTS toko_vectors_hf (
+    toko_id     INTEGER PRIMARY KEY,
+    kodetoko    VARCHAR(30),
+    namatoko    VARCHAR(100) NOT NULL,
+    alamat      VARCHAR(200),
+    kota        VARCHAR(100),
+    kecamatan   VARCHAR(100),
+    propinsi    VARCHAR(50),
+    hp          VARCHAR(30),
+    piutang     NUMERIC DEFAULT 0,
+    plafon      NUMERIC DEFAULT 0,
+    teks_cari   TEXT,
+    embedding   vector(384),
+    updated_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS toko_vectors_hf_idx
+ON toko_vectors_hf
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS produk_vectors_hf (
+    stock_id        INTEGER PRIMARY KEY,
+    kodebarang      VARCHAR(50),
+    namabarang      VARCHAR(250) NOT NULL,
+    satuan          VARCHAR(50),
+    kategori        VARCHAR(50),
+    brandproduct    VARCHAR(50),
+    merkkendaraan   VARCHAR(50),
+    typekendaraan   VARCHAR(50),
+    kendaraan       VARCHAR(50),
+    partno          VARCHAR(50),
+    teks_cari       TEXT,
+    embedding       vector(384),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS produk_vectors_hf_idx
+ON produk_vectors_hf
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- ── LiteLLM tables (768 dimensi) ─────────────────────────────
+
+CREATE TABLE IF NOT EXISTS toko_vectors_litellm (
+    toko_id     INTEGER PRIMARY KEY,
+    kodetoko    VARCHAR(30),
+    namatoko    VARCHAR(100) NOT NULL,
+    alamat      VARCHAR(200),
+    kota        VARCHAR(100),
+    kecamatan   VARCHAR(100),
+    propinsi    VARCHAR(50),
+    hp          VARCHAR(30),
+    piutang     NUMERIC DEFAULT 0,
+    plafon      NUMERIC DEFAULT 0,
+    teks_cari   TEXT,
+    embedding   vector(768),
+    updated_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS toko_vectors_litellm_idx
+ON toko_vectors_litellm
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS produk_vectors_litellm (
+    stock_id        INTEGER PRIMARY KEY,
+    kodebarang      VARCHAR(50),
+    namabarang      VARCHAR(250) NOT NULL,
+    satuan          VARCHAR(50),
+    kategori        VARCHAR(50),
+    brandproduct    VARCHAR(50),
+    merkkendaraan   VARCHAR(50),
+    typekendaraan   VARCHAR(50),
+    kendaraan       VARCHAR(50),
+    partno          VARCHAR(50),
+    teks_cari       TEXT,
+    embedding       vector(768),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS produk_vectors_litellm_idx
+ON produk_vectors_litellm
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Cek tabel yang sudah dibuat
+SELECT table_name, pg_size_pretty(pg_total_relation_size(quote_ident(table_name)))
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name LIKE '%vectors%'
+ORDER BY table_name;
+
+
+############################################################
+LOCATION: scripts\sync_embeddings.py
+############################################################
+
+import asyncio
+import sys
+import os
+import argparse
+import time
+
+# Pastikan path 'app' terbaca di paling awal
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.services.vector import (
+    upsert_toko, 
+    upsert_produk, 
+    get_table_toko, 
+    get_table_produk, 
+    get_vector_pool,
+    setup_tables
+)
+from app.services.erp import get_erp_pool
+from app.core.settings import get_settings
+import app.services.vector as vs
+
+async def sync_toko():
+    s = get_settings()
+    table_name = get_table_toko()
+    
+    # 1. Cek ID yang sudah ada di Database Vector (.221)
+    v_pool = await get_vector_pool()
+    async with v_pool.acquire() as v_conn:
+        print(f"[TOKO] Mengecek data yang sudah ada di {table_name}...")
+        existing_rows = await v_conn.fetch(f"SELECT toko_id FROM {table_name}")
+        # Paksa convert ke string untuk menghindari bug beda tipe data (int vs str)
+        done_ids = {str(r['toko_id']) for r in existing_rows}
+
+    # 2. Ambil data dari Database ERP (.26)
+    e_pool = await get_erp_pool()
+    async with e_pool.acquire() as e_conn:
+        
+        # KITA KUNCI STRUKTUR QUERY-NYA DISINI
+        query_bersih = """
+            SELECT t.id, t.kodetoko, t.namatoko, t.alamat, t.kota, t.kecamatan,
+                   t.propinsi, t.hp, t.piutangb, t.plafon
+            FROM mstr.toko t
+            INNER JOIN (
+                SELECT DISTINCT ON (tokoid) tokoid, statusaktif 
+                FROM mstr.tokoaktifpasif 
+                ORDER BY tokoid, tglstatus DESC
+            ) tap ON t.id = tap.tokoid
+            WHERE tap.statusaktif = true
+            ORDER BY t.id ASC;
+        """
+        
+        # ─── PROSES CETAK QUERY KE TERMINAL VS CODE ───
+        print("\n========================================================")
+        print("🔥 RUNNING SQL QUERY KE ERP (.26) 🔥")
+        print("========================================================")
+        print(query_bersih.strip())
+        print("========================================================\n")
+        
+        rows = await e_conn.fetch(query_bersih)
+        print(f"📊 [DATABASE ERP RETURN]: Berhasil menarik {len(rows)} baris data dari ERP.")
+
+    # 3. Filter: Ambil yang BELUM ADA di Vector DB
+    to_process = [row for row in rows if str(row['id']) not in done_ids]
+    total = len(to_process)
+
+    if total == 0:
+        print("[TOKO] Semua data toko sudah sinkron.")
+        return 0
+
+    print(f"[TOKO] Memproses {total} data baru (Resume mode)...")
+
+    success = 0
+    failed = 0
+    vs._current_provider = s.embedding_provider_toko
+
+    for i, row in enumerate(to_process):
+        try:
+            await upsert_toko(dict(row))
+            success += 1
+        except Exception as e:
+            failed += 1
+            if failed <= 5: print(f"   ERROR Toko {row['id']}: {e}")
+
+        if (i + 1) % 100 == 0 or (i + 1) == total:
+            print(f"   Progress: {i+1}/{total} | OK: {success} | Gagal: {failed}")
+
+    return success
+
+async def sync_produk():
+    s = get_settings()
+    table_name = get_table_produk()
+    
+    # 1. Cek ID yang sudah ada di Database Vector (.221)
+    v_pool = await get_vector_pool()
+    async with v_pool.acquire() as v_conn:
+        print(f"[PRODUK] Mengecek data yang sudah ada di {table_name}...")
+        existing_rows = await v_conn.fetch(f"SELECT stock_id FROM {table_name}")
+        done_ids = {r['stock_id'] for r in existing_rows}
+
+    # 2. Ambil data dari Database ERP (.26)
+    e_pool = await get_erp_pool()
+    async with e_pool.acquire() as e_conn:
+        rows = await e_conn.fetch(
+            """
+            SELECT id, kodebarang, namabarang, satuan, kategori,
+                   subkategori, brandproduct, merkkendaraan,
+                   typekendaraan, kendaraan, partno, groupstock
+            FROM mstr.stock
+            WHERE statusaktif = true
+            ORDER BY id
+            """
+        )
+
+    # 3. Filter: Hanya ambil yang ID-nya belum ada di Vector DB
+    to_process = [row for row in rows if row['id'] not in done_ids]
+    total = len(to_process)
+
+    if total == 0:
+        print("[PRODUK] Semua data produk sudah sinkron.")
+        return 0
+
+    print(f"[PRODUK] Memproses {total} data baru (Resume mode)...")
+
+    success = 0
+    failed = 0
+    vs._current_provider = s.embedding_provider_produk
+
+    for i, row in enumerate(to_process):
+        try:
+            await upsert_produk(dict(row))
+            success += 1
+        except Exception as e:
+            failed += 1
+            if failed <= 5: print(f"  ERROR Produk {row['id']}: {e}")
+
+        if (i + 1) % 100 == 0 or (i + 1) == total:
+            print(f"  Progress: {i+1}/{total} | OK: {success} | Gagal: {failed}")
+
+    return success
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--toko", action="store_true")
+    parser.add_argument("--produk", action="store_true")
+    args = parser.parse_args()
+
+    sync_all = not args.toko and not args.produk
+    s = get_settings()
+
+    print("=" * 60)
+    print("  Sync ERP → pgvector (Multi-Server Resume Mode)")
+    print("=" * 60)
+    print(f"Toko Provider   : {s.embedding_provider_toko}")
+    print(f"Produk Provider : {s.embedding_provider_produk}")
+
+    # Pastikan tabel-tabel di server .221 sudah siap
+    await setup_tables()
+
+    start = time.time()
+    t_count = p_count = 0
+
+    if args.toko or sync_all:
+        t_count = await sync_toko()
+    if args.produk or sync_all:
+        p_count = await sync_produk()
+
+    print(f"\nSelesai dalam {round(time.time() - start)} detik.")
+    if t_count: print(f"Toko   : {t_count} data baru")
+    if p_count: print(f"Produk : {p_count} data baru")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
